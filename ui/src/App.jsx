@@ -152,8 +152,8 @@ function App() {
     [frames]
   );
 
-  async function openVideo(path = videoPath) {
-    if (!path.trim()) {
+  async function openVideo(path = videoPath, outputDir = null) {
+    if (!path?.trim()) {
       setNotice("Indica la ruta del video.");
       setNoticeStrong(true);
       return;
@@ -163,7 +163,9 @@ function App() {
     setNotice("Buscando analysis.json...");
     setNoticeStrong(false);
     try {
-      const nextProject = await fetchJson(apiUrl("/api/project", { video_path: path.trim() }));
+      const params = { video_path: path.trim() };
+      if (outputDir) params.output_dir = outputDir;
+      const nextProject = await fetchJson(apiUrl("/api/project", params));
       setVideoPath(path.trim());
       setProject(nextProject);
       setFrameIndex(0);
@@ -475,7 +477,7 @@ function App() {
                 videos={videos}
                 activeIndex={frameIndex}
                 onSelectFrame={selectFrame}
-                onOpenVideo={openVideo}
+                onOpenVideo={(path, outputDir) => openVideo(path, outputDir)}
                 onRefreshVideos={loadVideos}
                 onPickFile={openPickedFile}
                 loadingVideoPath={loadingVideoPath}
@@ -638,42 +640,55 @@ function MediaPanel({
               </div>
             ) : videos.length ? (
               videos.map((video) => {
-                const isActive = project?.video?.path === video.path;
-                const isLoading = loadingVideoPath === video.path;
+                const isActive   = project?.video?.path === video.path;
+                const isLoading  = loadingVideoPath === video.path;
                 return (
-                  <button
-                    className={`relative grid grid-cols-[96px_1fr] gap-2 border bg-editor-850 p-1 text-left transition ${
-                      isActive ? "border-accent" : "border-editor-700 hover:border-editor-500"
-                    } ${isLoading ? "opacity-80" : ""}`}
-                    key={video.path}
-                    type="button"
-                    disabled={Boolean(loadingVideoPath)}
-                    onClick={() => onOpenVideo(video.path)}
-                  >
-                    <div className="relative h-14 overflow-hidden bg-black">
-                      <video className="h-full w-full object-cover" src={video.url} muted preload="metadata" />
-                      <span className="absolute bottom-1 right-1 bg-black/70 px-1 text-[10px] text-slate-200">
-                        {formatDuration(video.duration_s)}
-                      </span>
-                    </div>
-                    <div className="min-w-0">
-                      <div className="truncate text-[11px] font-semibold text-slate-200">{video.name}</div>
-                      <div className="mt-1 text-[10px] text-slate-500">
-                        {isLoading
-                          ? "cargando..."
-                          : isActive
-                            ? "video activo"
-                            : video.has_analysis
-                              ? "analysis.json listo"
-                              : "sin analisis"}
+                  <div key={video.path} className="grid gap-1">
+                    <button
+                      className={`relative grid grid-cols-[96px_1fr] gap-2 border bg-editor-850 p-1 text-left transition ${
+                        isActive ? "border-accent" : "border-editor-700 hover:border-editor-500"
+                      } ${isLoading ? "opacity-80" : ""}`}
+                      type="button"
+                      disabled={Boolean(loadingVideoPath)}
+                      onClick={() => onOpenVideo(video.path)}
+                    >
+                      <div className="relative h-14 overflow-hidden bg-black">
+                        <video className="h-full w-full object-cover" src={video.url} muted preload="metadata" />
+                        <span className="absolute bottom-1 right-1 bg-black/70 px-1 text-[10px] text-slate-200">
+                          {formatDuration(video.duration_s)}
+                        </span>
                       </div>
-                      {isLoading ? (
-                        <div className="mt-2 h-1 overflow-hidden bg-editor-950">
-                          <div className="h-full w-1/2 animate-pulse bg-accent" />
+                      <div className="min-w-0">
+                        <div className="truncate text-[11px] font-semibold text-slate-200">{video.name}</div>
+                        <div className="mt-1 text-[10px] text-slate-500">
+                          {isLoading
+                            ? "cargando..."
+                            : isActive
+                              ? "video activo"
+                              : video.has_analysis
+                                ? "analysis.json listo"
+                                : "sin analisis"}
                         </div>
-                      ) : null}
-                    </div>
-                  </button>
+                        {isLoading ? (
+                          <div className="mt-2 h-1 overflow-hidden bg-editor-950">
+                            <div className="h-full w-1/2 animate-pulse bg-accent" />
+                          </div>
+                        ) : null}
+                      </div>
+                    </button>
+
+                    {video.has_refined ? (
+                      <button
+                        className="flex items-center gap-2 border border-purple-700/50 bg-purple-950/30 px-2 py-1 text-left text-[11px] text-purple-300 hover:border-purple-500 disabled:opacity-50"
+                        type="button"
+                        disabled={Boolean(loadingVideoPath)}
+                        onClick={() => onOpenVideo(video.path, video.refined_output_dir)}
+                      >
+                        <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-purple-400" />
+                        <span className="truncate">{video.name} — refinado</span>
+                      </button>
+                    ) : null}
+                  </div>
                 );
               })
             ) : (

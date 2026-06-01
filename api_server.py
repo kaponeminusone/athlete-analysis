@@ -240,14 +240,18 @@ def list_videos():
             continue
         resolved = path.resolve()
         video_name = _video_name(str(resolved))
-        analysis_path = OUTPUT_ROOT / video_name / "analysis.json"
+        analysis_path  = OUTPUT_ROOT / video_name / "analysis.json"
+        refined_dir    = OUTPUT_ROOT / f"{video_name}_refined"
+        refined_path   = refined_dir / "analysis.json"
         videos.append({
-            "name": path.name,
-            "path": str(resolved),
-            "video_name": video_name,
-            "duration_s": _video_duration(resolved),
-            "has_analysis": analysis_path.exists(),
-            "url": _media_url(resolved),
+            "name":             path.name,
+            "path":             str(resolved),
+            "video_name":       video_name,
+            "duration_s":       _video_duration(resolved),
+            "has_analysis":     analysis_path.exists(),
+            "has_refined":      refined_path.exists(),
+            "refined_output_dir": str(refined_dir.resolve()) if refined_path.exists() else None,
+            "url":              _media_url(resolved),
         })
     videos.sort(key=lambda item: (not item["has_analysis"], item["name"].lower()))
     return {"videos": videos}
