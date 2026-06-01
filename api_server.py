@@ -476,6 +476,11 @@ def correct_frame(req: CorrectionRequest):
                 detail=f"SOT backend error: {sot_err}",
             )
 
+    # mask_correction with ByteTrack: apply to this frame only, no propagation
+    effective_radius = req.propagation_radius
+    if correction_type == "mask_correction" and req.sot_backend == "none":
+        effective_radius = 0
+
     # Propagate to adjacent frames
     info = get_video_info(req.video_path)
     updated_fas = propagate_correction(
@@ -486,7 +491,7 @@ def correct_frame(req: CorrectionRequest):
         model_seg=model_seg,
         model_pose=model_pose,
         track_state=state,
-        radius=req.propagation_radius,
+        radius=effective_radius,
         frames_dir=frames_dir,
         sot=sot,
         init_mask=corrected_mask,
