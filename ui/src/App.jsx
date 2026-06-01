@@ -129,6 +129,10 @@ function App() {
   }, []);
 
   useEffect(() => {
+    setDetections([]);
+  }, [frameIndex]);
+
+  useEffect(() => {
     function onKey(e) {
       if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA" || e.target.tagName === "SELECT") return;
       if (e.key === "ArrowRight") { e.preventDefault(); selectFrame(frameIndex + 1); }
