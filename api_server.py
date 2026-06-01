@@ -294,26 +294,36 @@ def debug_coords(
     ix2 = int(np.clip(x2, 0, w))
     iy2 = int(np.clip(y2, 0, h))
 
-    # Semi-transparent fill
-    overlay = img.copy()
-    cv2.rectangle(overlay, (ix1, iy1), (ix2, iy2), (0, 60, 255), -1)
-    cv2.addWeighted(overlay, 0.25, img, 0.75, 0, img)
-    # Solid border
-    cv2.rectangle(img, (ix1, iy1), (ix2, iy2), (0, 80, 255), 2)
-
     font = cv2.FONT_HERSHEY_SIMPLEX
-    for label, pt in [
-        (f"({ix1},{iy1})", (ix1 + 4, max(16, iy1 + 16))),
-        (f"({ix2},{iy2})", (max(0, ix2 - 80), min(h - 4, iy2 - 4))),
-    ]:
-        (tw, th), _ = cv2.getTextSize(label, font, 0.45, 1)
-        cv2.rectangle(img, (pt[0]-2, pt[1]-th-2), (pt[0]+tw+2, pt[1]+2), (0,0,0), -1)
-        cv2.putText(img, label, pt, font, 0.45, (0, 200, 255), 1, cv2.LINE_AA)
 
-    dim_label = f"Frame {frame_idx}  {w}x{h}px  UI-box=({ix1},{iy1})-({ix2},{iy2})"
-    (tw, th), _ = cv2.getTextSize(dim_label, font, 0.42, 1)
-    cv2.rectangle(img, (4, 4), (tw + 8, th + 8), (0, 0, 0), -1)
-    cv2.putText(img, dim_label, (6, th + 5), font, 0.42, (200, 200, 200), 1, cv2.LINE_AA)
+    # Draw a high-contrast bounding box visible on any background:
+    # thick black outline then bright yellow interior line
+    cv2.rectangle(img, (ix1, iy1), (ix2, iy2), (0, 0, 0), 6)       # black shadow
+    cv2.rectangle(img, (ix1, iy1), (ix2, iy2), (0, 230, 255), 3)    # yellow border
+    # corner markers
+    corner_len = max(10, (ix2 - ix1) // 6)
+    for cx, cy, dx, dy in [
+        (ix1, iy1,  1,  1), (ix2, iy1, -1,  1),
+        (ix1, iy2,  1, -1), (ix2, iy2, -1, -1),
+    ]:
+        cv2.line(img, (cx, cy), (cx + dx * corner_len, cy), (0, 230, 255), 4)
+        cv2.line(img, (cx, cy), (cx, cy + dy * corner_len), (0, 230, 255), 4)
+
+    # Corner coordinate labels
+    for label, pt in [
+        (f"({ix1},{iy1})", (max(0, ix1),     max(20, iy1 - 6))),
+        (f"({ix2},{iy2})", (max(0, ix2 - 90), min(h - 6, iy2 + 18))),
+    ]:
+        (tw, th), _ = cv2.getTextSize(label, font, 0.55, 2)
+        lx, ly = pt
+        cv2.rectangle(img, (lx-2, ly-th-3), (lx+tw+2, ly+3), (0,0,0), -1)
+        cv2.putText(img, label, (lx, ly), font, 0.55, (0, 230, 255), 2, cv2.LINE_AA)
+
+    # Header banner — always visible at top
+    banner = f"Frame {frame_idx}  src={w}x{h}  box=({ix1},{iy1})->({ix2},{iy2})  sz={ix2-ix1}x{iy2-iy1}"
+    (bw, bh), _ = cv2.getTextSize(banner, font, 0.55, 2)
+    cv2.rectangle(img, (0, 0), (w, bh + 12), (0, 0, 0), -1)
+    cv2.putText(img, banner, (6, bh + 5), font, 0.55, (0, 230, 255), 2, cv2.LINE_AA)
 
     # Encode to memory — no temp files needed
     ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 92])

@@ -727,6 +727,7 @@ function ViewerPanel({
   const [maskPoints, setMaskPoints] = useState([]);
   const [isPainting, setIsPainting] = useState(false);
   const [debugUrl, setDebugUrl] = useState(null);
+  const [layoutVersion, setLayoutVersion] = useState(0);  // bumped on resize → forces re-render
   const stageRef = useRef(null);
 
   useEffect(() => {
@@ -737,39 +738,50 @@ function ViewerPanel({
     setDebugUrl(null);
   }, [currentFrame?.frame_idx, correctionMode]);
 
+  // Re-render overlay positions whenever the stage container is resized
+  // (e.g. dragging the panel split handle)
+  useEffect(() => {
+    const el = stageRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => setLayoutVersion(v => v + 1));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
   function mediaMetrics() {
     const stage = stageRef.current;
     if (!stage) return null;
     const stageRect = stage.getBoundingClientRect();
 
-    // Get the actual rendered media element — don't assume anything about
-    // padding, grid, or flex: measure directly from the DOM.
     const mediaEl = stage.querySelector("[data-media]");
     if (!mediaEl) return null;
 
     const mediaRect = mediaEl.getBoundingClientRect();
 
-    // Intrinsic dimensions: from the element itself when available,
-    // fall back to analysis metadata.
-    const naturalWidth  = (mediaEl.naturalWidth  > 0 ? mediaEl.naturalWidth  : 0)
+    // Natural dimensions: video_info from analysis is the most reliable
+    // source because it's always set after analysis. Element properties
+    // (naturalWidth / videoWidth) may still be 0 while the media is loading.
+    const infoW = project?.analysis?.data?.video_info?.width;
+    const infoH = project?.analysis?.data?.video_info?.height;
+    const naturalWidth  = infoW
+                       || (mediaEl.naturalWidth  > 0 ? mediaEl.naturalWidth  : 0)
                        || (mediaEl.videoWidth    > 0 ? mediaEl.videoWidth    : 0)
-                       || project?.analysis?.data?.video_info?.width  || 1;
-    const naturalHeight = (mediaEl.naturalHeight > 0 ? mediaEl.naturalHeight : 0)
+                       || 1280;
+    const naturalHeight = infoH
+                       || (mediaEl.naturalHeight > 0 ? mediaEl.naturalHeight : 0)
                        || (mediaEl.videoHeight   > 0 ? mediaEl.videoHeight   : 0)
-                       || project?.analysis?.data?.video_info?.height || 1;
+                       || 720;
 
-    // object-contain: fits image inside the element box while preserving ratio
-    const elW = mediaRect.width;
-    const elH = mediaRect.height;
+    // object-contain letterbox within the element's rendered box
+    const elW   = mediaRect.width;
+    const elH   = mediaRect.height;
     const scale = Math.min(elW / naturalWidth, elH / naturalHeight);
     const displayWidth  = naturalWidth  * scale;
     const displayHeight = naturalHeight * scale;
-
-    // Letter-box offsets within the element
     const lbX = (elW - displayWidth)  / 2;
     const lbY = (elH - displayHeight) / 2;
 
-    // Offset from stage's top-left corner to the image's (0,0) pixel
+    // Offset from stage top-left to the image's pixel (0,0)
     const offsetX = (mediaRect.left - stageRect.left) + lbX;
     const offsetY = (mediaRect.top  - stageRect.top)  + lbY;
 
