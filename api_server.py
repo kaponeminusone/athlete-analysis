@@ -264,20 +264,20 @@ def debug_coords(
     x1: float, y1: float, x2: float, y2: float,
 ):
     """
-    Draw the UI-sent bbox on the actual raw frame and return the image.
-
-    Use this to validate coordinate mapping: if the red rectangle appears
-    exactly where the user drew it on screen, mediaMetrics() is correct.
-    If it's shifted or scaled, there is a calibration bug.
+    Draw the UI-sent bbox on the actual raw frame and return the JPEG.
+    Use this to verify coordinate mapping: if the red box matches the
+    drawn selection on screen, mediaMetrics() is correct.
     """
-    import tempfile
-    out_dir   = _output_dir(video_path)
-    frame_path = out_dir / "frames" / f"frame_{frame_idx:06d}.jpg"
+    from fastapi.responses import Response as RawResponse
 
-    # Load from saved frames; fall back to extracting from video
+    video_name = _video_name(video_path)
+    frame_path = OUTPUT_ROOT / video_name / "frames" / f"frame_{frame_idx:06d}.jpg"
+
     if frame_path.exists():
         img = cv2.imread(str(frame_path))
     else:
+        if not Path(video_path).exists():
+            raise HTTPException(404, f"Video not found: {video_path}")
         cap = cv2.VideoCapture(video_path)
         cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
         ret, img = cap.read()
@@ -285,35 +285,41 @@ def debug_coords(
         if not ret or img is None:
             raise HTTPException(400, f"Cannot read frame {frame_idx}")
 
-    h, w = img.shape[:2]
-    ix1, iy1 = int(np.clip(x1, 0, w)), int(np.clip(y1, 0, h))
-    ix2, iy2 = int(np.clip(x2, 0, w)), int(np.clip(y2, 0, h))
+    if img is None:
+        raise HTTPException(500, "Failed to load frame image")
 
-    # Draw semi-transparent fill + solid border + corner labels
+    h, w = img.shape[:2]
+    ix1 = int(np.clip(x1, 0, w - 1))
+    iy1 = int(np.clip(y1, 0, h - 1))
+    ix2 = int(np.clip(x2, 0, w))
+    iy2 = int(np.clip(y2, 0, h))
+
+    # Semi-transparent fill
     overlay = img.copy()
     cv2.rectangle(overlay, (ix1, iy1), (ix2, iy2), (0, 60, 255), -1)
     cv2.addWeighted(overlay, 0.25, img, 0.75, 0, img)
-    cv2.rectangle(img, (ix1, iy1), (ix2, iy2), (0, 60, 255), 2)
+    # Solid border
+    cv2.rectangle(img, (ix1, iy1), (ix2, iy2), (0, 80, 255), 2)
 
     font = cv2.FONT_HERSHEY_SIMPLEX
     for label, pt in [
-        (f"({ix1},{iy1})", (ix1 + 4, iy1 + 16)),
-        (f"({ix2},{iy2})", (max(0, ix2 - 90), iy2 - 6)),
+        (f"({ix1},{iy1})", (ix1 + 4, max(16, iy1 + 16))),
+        (f"({ix2},{iy2})", (max(0, ix2 - 80), min(h - 4, iy2 - 4))),
     ]:
-        cv2.rectangle(img,
-                      (pt[0] - 2, pt[1] - 13),
-                      (pt[0] + len(label) * 8, pt[1] + 3),
-                      (0, 0, 0), -1)
+        (tw, th), _ = cv2.getTextSize(label, font, 0.45, 1)
+        cv2.rectangle(img, (pt[0]-2, pt[1]-th-2), (pt[0]+tw+2, pt[1]+2), (0,0,0), -1)
         cv2.putText(img, label, pt, font, 0.45, (0, 200, 255), 1, cv2.LINE_AA)
 
-    # Frame dimensions watermark
-    dim_label = f"Frame {frame_idx}  {w}x{h}px"
-    cv2.rectangle(img, (4, 4), (len(dim_label) * 8 + 6, 20), (0, 0, 0), -1)
-    cv2.putText(img, dim_label, (6, 16), font, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
+    dim_label = f"Frame {frame_idx}  {w}x{h}px  UI-box=({ix1},{iy1})-({ix2},{iy2})"
+    (tw, th), _ = cv2.getTextSize(dim_label, font, 0.42, 1)
+    cv2.rectangle(img, (4, 4), (tw + 8, th + 8), (0, 0, 0), -1)
+    cv2.putText(img, dim_label, (6, th + 5), font, 0.42, (200, 200, 200), 1, cv2.LINE_AA)
 
-    tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
-    cv2.imwrite(tmp.name, img, [cv2.IMWRITE_JPEG_QUALITY, 92])
-    return FileResponse(tmp.name, media_type="image/jpeg")
+    # Encode to memory — no temp files needed
+    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 92])
+    if not ok:
+        raise HTTPException(500, "Failed to encode image")
+    return RawResponse(content=buf.tobytes(), media_type="image/jpeg")
 
 
 @app.get("/media")

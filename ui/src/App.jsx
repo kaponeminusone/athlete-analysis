@@ -740,35 +740,40 @@ function ViewerPanel({
   function mediaMetrics() {
     const stage = stageRef.current;
     if (!stage) return null;
-    const rect = stage.getBoundingClientRect();
+    const stageRect = stage.getBoundingClientRect();
 
-    // Read actual CSS padding so we don't assume a hardcoded value
-    const cs = window.getComputedStyle(stage);
-    const padL = parseFloat(cs.paddingLeft)  || 0;
-    const padT = parseFloat(cs.paddingTop)   || 0;
-    const padR = parseFloat(cs.paddingRight) || 0;
-    const padB = parseFloat(cs.paddingBottom)|| 0;
+    // Get the actual rendered media element — don't assume anything about
+    // padding, grid, or flex: measure directly from the DOM.
+    const mediaEl = stage.querySelector("[data-media]");
+    if (!mediaEl) return null;
 
-    // Content area available to the img / video element
-    const contentW = rect.width  - padL - padR;
-    const contentH = rect.height - padT - padB;
+    const mediaRect = mediaEl.getBoundingClientRect();
 
-    // Prefer live video dimensions; fall back to analysis metadata
-    const naturalWidth  = (videoRef.current?.videoWidth  > 0 ? videoRef.current.videoWidth  : 0)
+    // Intrinsic dimensions: from the element itself when available,
+    // fall back to analysis metadata.
+    const naturalWidth  = (mediaEl.naturalWidth  > 0 ? mediaEl.naturalWidth  : 0)
+                       || (mediaEl.videoWidth    > 0 ? mediaEl.videoWidth    : 0)
                        || project?.analysis?.data?.video_info?.width  || 1;
-    const naturalHeight = (videoRef.current?.videoHeight > 0 ? videoRef.current.videoHeight : 0)
+    const naturalHeight = (mediaEl.naturalHeight > 0 ? mediaEl.naturalHeight : 0)
+                       || (mediaEl.videoHeight   > 0 ? mediaEl.videoHeight   : 0)
                        || project?.analysis?.data?.video_info?.height || 1;
 
-    // object-contain scale within the content area
-    const scale = Math.min(contentW / naturalWidth, contentH / naturalHeight);
+    // object-contain: fits image inside the element box while preserving ratio
+    const elW = mediaRect.width;
+    const elH = mediaRect.height;
+    const scale = Math.min(elW / naturalWidth, elH / naturalHeight);
     const displayWidth  = naturalWidth  * scale;
     const displayHeight = naturalHeight * scale;
 
-    // Offset from the stage rect top-left to the actual image top-left
-    const offsetX = padL + (contentW - displayWidth)  / 2;
-    const offsetY = padT + (contentH - displayHeight) / 2;
+    // Letter-box offsets within the element
+    const lbX = (elW - displayWidth)  / 2;
+    const lbY = (elH - displayHeight) / 2;
 
-    return { rect, naturalWidth, naturalHeight, scale, displayWidth, displayHeight, offsetX, offsetY };
+    // Offset from stage's top-left corner to the image's (0,0) pixel
+    const offsetX = (mediaRect.left - stageRect.left) + lbX;
+    const offsetY = (mediaRect.top  - stageRect.top)  + lbY;
+
+    return { rect: stageRect, naturalWidth, naturalHeight, scale, displayWidth, displayHeight, offsetX, offsetY };
   }
 
   function eventToFramePoint(event) {
@@ -883,21 +888,27 @@ function ViewerPanel({
   }
 
   function handlePointerUp(event) {
-    if (correctionMode === "bbox_correction" && dragBox) {
-      const point = eventToFramePoint(event) || dragBox.end;
-      const x1 = Math.min(dragBox.start.x, point.x);
-      const y1 = Math.min(dragBox.start.y, point.y);
-      const x2 = Math.max(dragBox.start.x, point.x);
-      const y2 = Math.max(dragBox.start.y, point.y);
+    if (correctionMode === "bbox_correction" && dragStart) {
+      // Freeze the box — don't submit yet. Let user Validar or Aplicar.
+      const point = eventToFramePoint(event) || dragBox?.end;
+      if (point) setDragBox({ start: dragStart, end: point });
       setDragStart(null);
-      setDragBox(null);
-      if (Math.abs(x2 - x1) > 8 && Math.abs(y2 - y1) > 8) {
-        onSubmitCorrection("bbox_correction", { x1, y1, x2, y2 });
-      }
     }
     if (correctionMode === "mask_correction") {
       setIsPainting(false);
     }
+  }
+
+  function submitBbox() {
+    if (!dragBox) return;
+    const x1 = Math.min(dragBox.start.x, dragBox.end.x);
+    const y1 = Math.min(dragBox.start.y, dragBox.end.y);
+    const x2 = Math.max(dragBox.start.x, dragBox.end.x);
+    const y2 = Math.max(dragBox.start.y, dragBox.end.y);
+    if (Math.abs(x2 - x1) < 5 || Math.abs(y2 - y1) < 5) return;
+    setDragBox(null);
+    setDebugUrl(null);
+    onSubmitCorrection("bbox_correction", { x1, y1, x2, y2 });
   }
 
   return (
@@ -931,6 +942,7 @@ function ViewerPanel({
         {mode === "video" && project?.video.exists ? (
           <video
             ref={videoRef}
+            data-media
             className="h-full w-full select-none object-contain"
             src={project.video.url}
             controls
@@ -940,6 +952,7 @@ function ViewerPanel({
           />
         ) : frameImage ? (
           <img
+            data-media
             className="h-full w-full select-none object-contain"
             src={frameImage}
             alt="Frame YOLO"
@@ -973,15 +986,31 @@ function ViewerPanel({
           onClearMask={() => setMaskPoints([])}
         />
 
-        {/* Validate button — shown when a bbox is drawn */}
-        {correctionMode === "bbox_correction" && dragBox && !isCorrecting ? (
-          <button
-            className="absolute bottom-2 right-2 z-50 border border-yellow-500 bg-yellow-900/80 px-3 py-1 text-[11px] text-yellow-200 hover:bg-yellow-800"
-            type="button"
-            onClick={validateBox}
-          >
-            Validar coords
-          </button>
+        {/* Bbox action bar — shown while a box is drawn, before submitting */}
+        {correctionMode === "bbox_correction" && dragBox && !dragStart && !isCorrecting ? (
+          <div className="absolute bottom-2 right-2 z-50 flex gap-1">
+            <button
+              className="border border-yellow-500 bg-yellow-900/90 px-3 py-1 text-[11px] text-yellow-200 hover:bg-yellow-800"
+              type="button"
+              onClick={validateBox}
+            >
+              Validar
+            </button>
+            <button
+              className="border border-accent bg-accent/20 px-3 py-1 text-[11px] text-accent hover:bg-accent/30"
+              type="button"
+              onClick={submitBbox}
+            >
+              Aplicar
+            </button>
+            <button
+              className="border border-editor-600 bg-editor-900/90 px-2 py-1 text-[11px] text-slate-400 hover:bg-editor-800"
+              type="button"
+              onClick={() => { setDragBox(null); setDebugUrl(null); }}
+            >
+              ✕
+            </button>
+          </div>
         ) : null}
 
         {/* Debug overlay — full-frame image with server-drawn bbox */}
