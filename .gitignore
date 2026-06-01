@@ -1,0 +1,12 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+output/
+*.pt
+ui/node_modules/
+ui/dist/
+.env
+*.mp4
+*.mov
+*.avi

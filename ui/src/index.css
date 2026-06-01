@@ -1,0 +1,45 @@
+@import "tailwindcss";
+
+@theme {
+  --color-accent: #22c7a9;
+  --color-editor-950: #0b1016;
+  --color-editor-900: #0d1319;
+  --color-editor-850: #111820;
+  --color-editor-800: #151c24;
+  --color-editor-700: #25303a;
+  --color-editor-600: #34414f;
+  --font-sans: "Segoe UI", Arial, sans-serif;
+}
+
+html,
+body,
+#root {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  overflow: hidden;
+  background: #0b1016;
+  font-family: "Segoe UI", Arial, sans-serif;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: default;
+  opacity: 0.65;
+}
+
+* {
+  scrollbar-color: #34414f #0b1016;
+  scrollbar-width: thin;
+}

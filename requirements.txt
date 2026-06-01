@@ -1,0 +1,19 @@
+# Triple Jump Analysis — Prototype Dependencies
+# Install PyTorch FIRST (see README below), then install this file.
+#
+# For GTX 1050 (CUDA 11.8):
+#   pip install torch==2.3.0 torchvision==0.18.0 --index-url https://download.pytorch.org/whl/cu118
+#
+# For RTX 3050 (CUDA 12.1):
+#   pip install torch==2.3.0 torchvision==0.18.0 --index-url https://download.pytorch.org/whl/cu121
+#
+# Then:
+#   pip install -r requirements.txt
+
+ultralytics>=8.3.0
+opencv-python>=4.9.0
+numpy>=1.26.0
+scipy>=1.13.0
+matplotlib>=3.9.0
+fastapi>=0.115.0
+uvicorn>=0.30.0
