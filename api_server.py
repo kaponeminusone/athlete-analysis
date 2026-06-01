@@ -131,6 +131,7 @@ class CorrectionRequest(BaseModel):
     type:                Optional[str] = None   # UI alias for correction_type
     data:                dict  # {"x1","y1","x2","y2"} or {"x","y"} or {"mask":[...]}
     propagation_radius:  int   = 15
+    propagation_end_frame: Optional[int] = None  # specific end frame for forward pass
     sot_backend:         str   = "none"         # "none" | "csrt" | "sam2"
 
 
@@ -381,7 +382,7 @@ def correct_frame(req: CorrectionRequest):
         all_dets  = detections_for_frame(frame_img, model_seg)
 
     # Apply correction
-    corrected_fa = apply_correction(
+    corrected_fa, corrected_mask = apply_correction(
         correction=correction,
         frame_path=frame_path,
         model_pose=model_pose,
@@ -422,6 +423,8 @@ def correct_frame(req: CorrectionRequest):
         radius=req.propagation_radius,
         frames_dir=frames_dir,
         sot=sot,
+        init_mask=corrected_mask,
+        end_frame=req.propagation_end_frame,
     )
 
     # Re-annotate updated frames

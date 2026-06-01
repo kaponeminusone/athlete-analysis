@@ -111,6 +111,7 @@ function App() {
   const [correctionMode, setCorrectionMode] = useState("inspect");
   const [sotBackend, setSotBackend] = useState("none");
   const [stride, setStride] = useState(3);
+  const [propagationEndFrame, setPropagationEndFrame] = useState(null); // frame_idx (not array index)
   const [detections, setDetections] = useState([]);
   const [correctionVersion, setCorrectionVersion] = useState(0);
   const videoRef = useRef(null);
@@ -266,11 +267,13 @@ function App() {
           type,
           data,
           propagation_radius: 15,
+          propagation_end_frame: propagationEndFrame ?? undefined,
           sot_backend: sotBackend,
         }),
       });
       await refreshProject(project.video.path);
       setDetections([]);
+      setPropagationEndFrame(null);
       setNotice(`Correccion aplicada: ${result.total_affected} frames afectados.`);
     } catch (error) {
       setNotice(error.message);
@@ -442,6 +445,9 @@ function App() {
                 setSotBackend={setSotBackend}
                 stride={stride}
                 setStride={setStride}
+                propagationEndFrame={propagationEndFrame}
+                setPropagationEndFrame={setPropagationEndFrame}
+                currentFrameIdx={currentFrame?.frame_idx ?? null}
                 onLoadDetections={loadDetections}
                 isCorrecting={isCorrecting}
                 isLoadingDetections={isLoadingDetections}
@@ -458,6 +464,13 @@ function App() {
             currentFrame={currentFrame}
             currentIndex={frameIndex}
             onSelectFrame={selectFrame}
+            propagationEndFrame={propagationEndFrame}
+            onShiftSelect={(idx) => {
+              const f = frames[idx];
+              if (!f || !currentFrame) return;
+              if (f.frame_idx !== currentFrame.frame_idx)
+                setPropagationEndFrame(f.frame_idx > currentFrame.frame_idx ? f.frame_idx : null);
+            }}
           />
         </Panel>
       </PanelGroup>
@@ -922,7 +935,7 @@ function CorrectionOverlay({
   );
 }
 
-function Timeline({ frames, currentIndex, onSelect, duration }) {
+function Timeline({ frames, currentIndex, onSelect, duration, propagationEndFrame, onShiftSelect }) {
   if (!frames.length) {
     return <div className="m-2 border border-editor-700 bg-editor-850 px-2 py-2 text-[10px] uppercase text-slate-500">Timeline</div>;
   }
@@ -930,9 +943,19 @@ function Timeline({ frames, currentIndex, onSelect, duration }) {
   const total = duration || frames.at(-1)?.timestamp_s || frames.length;
   const currentFrame = frames[currentIndex];
 
+  // range for highlight: from current frame_idx to propagationEndFrame
+  const rangeStart = currentFrame?.frame_idx ?? null;
+  const rangeEnd   = propagationEndFrame;
+  const hasRange   = rangeStart !== null && rangeEnd !== null && rangeEnd > rangeStart;
+
   function handleWheel(e) {
     e.preventDefault();
     onSelect(currentIndex + (e.deltaY > 0 ? 1 : -1));
+  }
+
+  function handleClick(e, index) {
+    if (e.shiftKey) { onShiftSelect?.(index); }
+    else            { onSelect(index); }
   }
 
   return (
@@ -964,6 +987,7 @@ function Timeline({ frames, currentIndex, onSelect, duration }) {
             ? (angleColors[frame.camera_angle] || angleColors.UNKNOWN)
             : "#1e2433";
           const isActive = index === currentIndex;
+          const inRange  = hasRange && frame.frame_idx > rangeStart && frame.frame_idx <= rangeEnd;
 
           return (
             <button
@@ -971,12 +995,18 @@ function Timeline({ frames, currentIndex, onSelect, duration }) {
               type="button"
               className={`absolute bottom-0 top-5 overflow-hidden border-r border-black/30 p-0 ${
                 isActive ? "ring-2 ring-white ring-inset z-10" : ""
-              }`}
-              style={{ left: `${start}%`, width: `${width}%` }}
+              } ${inRange ? "brightness-125" : ""}`}
+              style={{
+                left: `${start}%`,
+                width: `${width}%`,
+                outline: inRange ? "1px solid rgba(250,204,21,0.6)" : undefined,
+              }}
               title={`Frame ${frame.frame_idx} · ${frame.timestamp_s?.toFixed(2)}s\n${
                 detected ? `Deteccion: SI · ${frame.camera_angle}` : "Deteccion: NO"
-              }${frame.quality_score != null ? ` · Q=${frame.quality_score}` : ""}`}
-              onClick={() => onSelect(index)}
+              }${frame.quality_score != null ? ` · Q=${frame.quality_score}` : ""}${
+                inRange ? "\n[en rango de propagacion]" : ""
+              }`}
+              onClick={(e) => handleClick(e, index)}
             >
               {/* Franja superior: estado de deteccion (40% del alto) */}
               <div
@@ -1024,6 +1054,9 @@ function Inspector({
   setSotBackend,
   stride,
   setStride,
+  propagationEndFrame,
+  setPropagationEndFrame,
+  currentFrameIdx,
   onLoadDetections,
   isCorrecting,
   isLoadingDetections,
@@ -1105,6 +1138,32 @@ function Inspector({
           <p className="mt-1 text-[10px] leading-4 text-slate-500">
             CSRT usa fallback MIL si no hay opencv-contrib. SAM2 requiere checkpoint instalado.
           </p>
+        </div>
+
+        {/* Propagation range indicator */}
+        <div className="mt-2">
+          <label className="mb-1 block text-[10px] font-bold uppercase text-slate-500">
+            Rango de propagacion
+          </label>
+          {propagationEndFrame !== null && currentFrameIdx !== null ? (
+            <div className="flex items-center gap-1">
+              <span className="flex-1 border border-yellow-500/40 bg-yellow-500/10 px-2 py-1 text-[11px] text-yellow-300">
+                Frame {currentFrameIdx} → {propagationEndFrame}
+              </span>
+              <button
+                className="h-[26px] border border-editor-600 bg-editor-850 px-2 text-[11px] text-slate-400"
+                type="button"
+                onClick={() => setPropagationEndFrame(null)}
+              >
+                ✕
+              </button>
+            </div>
+          ) : (
+            <p className="text-[10px] leading-4 text-slate-500">
+              Shift+Click en el timeline para fijar el frame final de propagacion.
+              Sin seleccion usa radio ±15.
+            </p>
+          )}
         </div>
       </div>
 
@@ -1258,14 +1317,21 @@ function DetectionDataPanel({ frame, compact = false }) {
   );
 }
 
-function BottomPanel({ project, summary, frames, currentIndex, onSelectFrame }) {
+function BottomPanel({ project, summary, frames, currentIndex, onSelectFrame, propagationEndFrame, onShiftSelect }) {
   const distribution = Object.entries(summary.camera_angle_distribution || {}).sort((a, b) => Number(b[1]) - Number(a[1]));
   const duration = project?.analysis?.data?.video_info?.duration_s;
 
   return (
     <div className="grid h-full grid-rows-[72px_32px] bg-editor-850">
       <div className="border-b border-black bg-editor-900">
-        <Timeline frames={frames} currentIndex={currentIndex} onSelect={onSelectFrame} duration={duration} />
+        <Timeline
+          frames={frames}
+          currentIndex={currentIndex}
+          onSelect={onSelectFrame}
+          duration={duration}
+          propagationEndFrame={propagationEndFrame}
+          onShiftSelect={onShiftSelect}
+        />
       </div>
       <div className="flex items-center gap-3 overflow-x-auto border-t border-editor-700 bg-editor-850 px-2 text-[11px] text-slate-400">
         <span className="shrink-0 font-bold uppercase text-slate-300">Distribucion</span>

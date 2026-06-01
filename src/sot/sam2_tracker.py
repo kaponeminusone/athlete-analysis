@@ -129,22 +129,49 @@ class Sam2SotTracker(SotBackend):
     def is_active(self) -> bool:
         return self._active
 
-    def initialize(self, frame: np.ndarray, bbox: tuple) -> None:
+    def initialize(self, frame: np.ndarray, bbox: tuple,
+                   mask: Optional[np.ndarray] = None) -> None:
         self._ensure_loaded()
-        self._frame_hw = frame.shape[:2]
-        x1, y1, x2, y2 = (float(v) for v in bbox)
-        prompt = np.array([[x1, y1, x2, y2]])
+        import torch
 
-        mask = self._predict(frame, prompt)
-        if mask is not None:
-            self._last_mask = mask
-            self._last_bbox = self._bbox_from_mask(mask) or tuple(int(v) for v in bbox)
+        self._frame_hw = frame.shape[:2]
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        if mask is not None and mask.any():
+            # Sample positive points from the mask — more informative than
+            # bbox alone for thin / non-rectangular athlete shapes.
+            ys, xs = np.where(mask)
+            n = min(len(xs), 8)
+            idx = np.linspace(0, len(xs) - 1, n, dtype=int)
+            point_coords = np.stack([xs[idx], ys[idx]], axis=1).astype(float)
+            point_labels = np.ones(n, dtype=int)
+            prompt_box   = None
+            prompt_str   = "mask points"
+        else:
+            x1, y1, x2, y2 = (float(v) for v in bbox)
+            point_coords  = None
+            point_labels  = None
+            prompt_box    = np.array([[x1, y1, x2, y2]])
+            prompt_str    = "bbox"
+
+        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+            self._predictor.set_image(frame_rgb)
+            predicted, scores, _ = self._predictor.predict(
+                point_coords=point_coords,
+                point_labels=point_labels,
+                box=prompt_box,
+                multimask_output=False,
+            )
+
+        if predicted is not None and len(predicted) > 0:
+            self._last_mask = predicted[0].astype(bool)
+            self._last_bbox = self._bbox_from_mask(self._last_mask) or tuple(int(v) for v in bbox)
         else:
             self._last_mask = None
             self._last_bbox = tuple(int(v) for v in bbox)
 
         self._active = True
-        print(f"  [SAM2] Initialized  bbox={self._last_bbox}  mask={'yes' if mask is not None else 'no'}")
+        print(f"  [SAM2] Initialized  bbox={self._last_bbox}  prompt={prompt_str}  mask={'yes' if self._last_mask is not None else 'no'}")
 
     def update(self, frame: np.ndarray, frame_idx: int = 0) -> tuple[bool, tuple]:
         if not self._active or self._last_bbox is None:

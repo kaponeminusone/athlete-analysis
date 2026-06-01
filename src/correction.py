@@ -97,7 +97,7 @@ def apply_correction(
     model_pose,
     track_state: TrackState,
     all_detections: Optional[list[dict]] = None,   # from seg model on same frame
-) -> FrameAnalysis:
+) -> tuple[FrameAnalysis, Optional[np.ndarray]]:  # (fa, seg_mask)
     """
     Re-compute pose estimation for a single frame using the manual correction.
 
@@ -209,7 +209,7 @@ def apply_correction(
           f"{correction.correction_type} — kps valid: "
           f"{fa.keypoints_valid_count}/11, Q={fa.quality_score:.2f}")
 
-    return fa
+    return fa, seg_mask
 
 
 def propagate_correction(
@@ -223,6 +223,8 @@ def propagate_correction(
     radius: int = 15,
     frames_dir: Optional[str] = None,
     sot: Optional[SotBackend] = None,
+    init_mask: Optional[np.ndarray] = None,     # seg mask of the corrected frame
+    end_frame: Optional[int] = None,            # override forward propagation end
 ) -> list[FrameAnalysis]:
     """
     Re-analyze frames [frame_idx - radius .. frame_idx + radius] using
@@ -245,6 +247,9 @@ def propagate_correction(
     end_f   = corrected_frame_idx + radius
 
     use_sot = sot is not None and corrected_fa.person_bbox is not None
+    # Allow caller to set a specific end frame for the forward pass
+    if end_frame is not None:
+        end_f = min(end_frame, end_f)
     print(f"  [Propagation] Re-analyzing frames {start_f}–{end_f} "
           f"(radius={radius}, backend={'bytetrack' if not use_sot else sot.tracking_source}) ...")
 
@@ -277,7 +282,7 @@ def propagate_correction(
     ret, init_frame = cap.read()   # read corrected frame (to init SOT)
 
     if use_sot and ret:
-        sot.initialize(init_frame, corrected_fa.person_bbox)
+        sot.initialize(init_frame, corrected_fa.person_bbox, mask=init_mask)
 
     frame_idx = corrected_frame_idx + 1
     while frame_idx <= end_f:

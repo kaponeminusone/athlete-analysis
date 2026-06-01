@@ -25,11 +25,16 @@ class SotBackend(ABC):
         ...
 
     @abstractmethod
-    def initialize(self, frame: np.ndarray, bbox: tuple) -> None:
+    def initialize(self, frame: np.ndarray, bbox: tuple,
+                   mask: Optional[np.ndarray] = None) -> None:
         """
         Seed the tracker with the corrected frame and bounding box.
 
         bbox: (x1, y1, x2, y2) in pixel coordinates, full-frame space.
+        mask: optional bool [H, W] segmentation mask of the athlete.
+              CSRT uses it to neutralize background before building
+              the correlation filter — improves appearance fidelity.
+              SAM 2 uses it as a pixel-level prompt (better than bbox).
         Must be called once before any update() calls.
         """
         ...

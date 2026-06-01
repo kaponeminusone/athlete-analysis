@@ -70,14 +70,29 @@ class CsrtSotTracker(SotBackend):
     def is_active(self) -> bool:
         return self._active
 
-    def initialize(self, frame: np.ndarray, bbox: tuple) -> None:
+    def initialize(self, frame: np.ndarray, bbox: tuple,
+                   mask: Optional[np.ndarray] = None) -> None:
         x1, y1, x2, y2 = (int(v) for v in bbox)
+
+        if mask is not None and mask.any():
+            # Replace background pixels with the per-channel mean of the
+            # athlete region so the correlation filter models athlete
+            # appearance, not scene background.
+            init_frame = frame.copy()
+            athlete_pixels = frame[mask]
+            bg_color = (athlete_pixels.mean(axis=0).astype(np.uint8)
+                        if len(athlete_pixels) else np.array([128, 128, 128], dtype=np.uint8))
+            init_frame[~mask] = bg_color
+        else:
+            init_frame = frame
+
         self._tracker, self._algo_name = _make_opencv_tracker()
         # OpenCV trackers expect (x, y, width, height)
-        self._tracker.init(frame, (x1, y1, x2 - x1, y2 - y1))
+        self._tracker.init(init_frame, (x1, y1, x2 - x1, y2 - y1))
         self._last_bbox = (x1, y1, x2, y2)
         self._active    = True
-        print(f"  [CSRT/{self._algo_name}] Initialized  bbox=({x1},{y1},{x2},{y2})")
+        masked_str = "with mask" if mask is not None else "bbox only"
+        print(f"  [CSRT/{self._algo_name}] Initialized  bbox=({x1},{y1},{x2},{y2})  {masked_str}")
 
     def update(self, frame: np.ndarray, frame_idx: int = 0) -> tuple[bool, tuple]:
         if not self._active or self._tracker is None:
