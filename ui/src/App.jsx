@@ -690,13 +690,33 @@ function ViewerPanel({
     const stage = stageRef.current;
     if (!stage) return null;
     const rect = stage.getBoundingClientRect();
-    const naturalWidth = project?.analysis?.data?.video_info?.width || videoRef.current?.videoWidth || 1;
-    const naturalHeight = project?.analysis?.data?.video_info?.height || videoRef.current?.videoHeight || 1;
-    const scale = Math.min(rect.width / naturalWidth, rect.height / naturalHeight);
-    const displayWidth = naturalWidth * scale;
+
+    // Read actual CSS padding so we don't assume a hardcoded value
+    const cs = window.getComputedStyle(stage);
+    const padL = parseFloat(cs.paddingLeft)  || 0;
+    const padT = parseFloat(cs.paddingTop)   || 0;
+    const padR = parseFloat(cs.paddingRight) || 0;
+    const padB = parseFloat(cs.paddingBottom)|| 0;
+
+    // Content area available to the img / video element
+    const contentW = rect.width  - padL - padR;
+    const contentH = rect.height - padT - padB;
+
+    // Prefer live video dimensions; fall back to analysis metadata
+    const naturalWidth  = (videoRef.current?.videoWidth  > 0 ? videoRef.current.videoWidth  : 0)
+                       || project?.analysis?.data?.video_info?.width  || 1;
+    const naturalHeight = (videoRef.current?.videoHeight > 0 ? videoRef.current.videoHeight : 0)
+                       || project?.analysis?.data?.video_info?.height || 1;
+
+    // object-contain scale within the content area
+    const scale = Math.min(contentW / naturalWidth, contentH / naturalHeight);
+    const displayWidth  = naturalWidth  * scale;
     const displayHeight = naturalHeight * scale;
-    const offsetX = (rect.width - displayWidth) / 2;
-    const offsetY = (rect.height - displayHeight) / 2;
+
+    // Offset from the stage rect top-left to the actual image top-left
+    const offsetX = padL + (contentW - displayWidth)  / 2;
+    const offsetY = padT + (contentH - displayHeight) / 2;
+
     return { rect, naturalWidth, naturalHeight, scale, displayWidth, displayHeight, offsetX, offsetY };
   }
 
