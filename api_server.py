@@ -119,7 +119,7 @@ def _save_analysis(video_name: str, frames_data: list[dict], extra: dict = {}):
 
 class AnalyzeRequest(BaseModel):
     video_path: str
-    stride:     int   = 3
+    stride:     int   = 1
     start_sec:  float = 0.0
     end_sec:    Optional[float] = None
 
@@ -276,7 +276,7 @@ def _start_analysis_job(req: AnalyzeRequest) -> dict:
         start_sec=req.start_sec,
         end_sec=req.end_sec,
         use_seg=True,
-        annotate_every=3,
+        annotate_every=1,
     )
 
     def _run():
