@@ -83,39 +83,46 @@ class RobustAppearanceModel:
 
     ZONE_BOUNDS  = [(0.00, 0.25), (0.25, 0.70), (0.70, 1.00)]
     ZONE_WEIGHTS = [0.10,          0.60,          0.30]
-    BINS_H, BINS_S, BINS_V = 32, 8, 8
-    SAT_ACHROMATIC = 40      # pixels with S < this are "achromatic" (white/gray/black)
+    BINS_H, BINS_S, BINS_V = 32, 8, 8   # 2048 bins per zone — captures hue, saturation, brightness
     MAX_REFS = 20
     MAX_NEGS = 15
 
     def __init__(self) -> None:
-        self._pos_refs:  list[tuple[list[np.ndarray], float]] = []  # (zone_hists, achromatic_ratio)
+        self._pos_refs:  list[list[np.ndarray]] = []   # zone histograms per positive reference
         self._neg_refs:  list[list[np.ndarray]] = []
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _zone_features(self, img: np.ndarray,
                         mask: Optional[np.ndarray],
-                        bbox: tuple) -> tuple[list[np.ndarray], float]:
-        """Compute per-zone histograms + overall achromatic ratio."""
+                        bbox: tuple) -> list[np.ndarray]:
+        """
+        Compute per-zone HSV histograms.
+
+        The 3-axis histogram (hue × saturation × value) already captures
+        everything needed to distinguish any two clothing colors:
+          - white vs yellow: separated by the saturation axis
+          - yellow vs red:   separated by the hue axis
+          - dark vs light:   separated by the value axis
+        No separate achromatic ratio is needed — it would only work for
+        white clothing and breaks for any other color pair.
+        """
         x1, y1, x2, y2 = (int(v) for v in bbox)
         bh = max(y2 - y1, 1)
         h, w = img.shape[:2]
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
         hists: list[np.ndarray] = []
-        ach_vals: list[float] = []
 
         for (z0, z1) in self.ZONE_BOUNDS:
             zy1 = max(0, y1 + int(bh * z0))
             zy2 = min(h, y1 + int(bh * z1))
             zm = np.zeros((h, w), dtype=np.uint8)
             if mask is not None:
-                zm[zy1:zy2, x1:x2] = (mask[zy1:zy2, x1:x2].astype(np.uint8)) * 255
+                zm[zy1:zy2, x1:x2] = mask[zy1:zy2, x1:x2].astype(np.uint8) * 255
             else:
                 zm[zy1:zy2, x1:x2] = 255
 
-            n_px = int(zm.sum() / 255)
-            if n_px < 20:
+            if int(zm.sum() / 255) < 20:
                 hists.append(np.zeros(self.BINS_H * self.BINS_S * self.BINS_V, dtype=np.float32))
                 continue
 
@@ -125,11 +132,7 @@ class RobustAppearanceModel:
             cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
             hists.append(hist.flatten().astype(np.float32))
 
-            sat = hsv[zm > 0, 1]
-            ach_vals.append(float((sat < self.SAT_ACHROMATIC).mean()))
-
-        achromatic = float(np.mean(ach_vals)) if ach_vals else 0.5
-        return hists, achromatic
+        return hists
 
     def _zone_dist(self, hists_a: list[np.ndarray],
                    hists_b: list[np.ndarray]) -> float:
@@ -147,14 +150,14 @@ class RobustAppearanceModel:
 
     def add_positive(self, img: np.ndarray,
                      mask: Optional[np.ndarray], bbox: tuple) -> None:
-        hists, ach = self._zone_features(img, mask, bbox)
-        self._pos_refs.append((hists, ach))
+        hists = self._zone_features(img, mask, bbox)
+        self._pos_refs.append(hists)
         if len(self._pos_refs) > self.MAX_REFS:
             self._pos_refs.pop(0)
 
     def add_negative(self, img: np.ndarray,
                      mask: Optional[np.ndarray], bbox: tuple) -> None:
-        hists, _ = self._zone_features(img, mask, bbox)
+        hists = self._zone_features(img, mask, bbox)
         self._neg_refs.append(hists)
         if len(self._neg_refs) > self.MAX_NEGS:
             self._neg_refs.pop(0)
@@ -175,30 +178,29 @@ class RobustAppearanceModel:
         if not self._pos_refs:
             return 0.5
 
-        cand_hists, cand_ach = self._zone_features(img, mask, bbox)
+        cand_hists = self._zone_features(img, mask, bbox)
 
-        # (a) Achromatic ratio comparison
-        ref_ach = float(np.mean([r[1] for r in self._pos_refs]))
-        ach_diff = abs(ref_ach - cand_ach)
-        # Full penalty at diff >= 0.50, none at diff == 0
-        ach_factor = float(np.clip(1.0 - ach_diff * 2.0, 0.0, 1.0))
+        # (a) Positive similarity — median Bhattacharyya distance across all
+        #     stored references, converted to similarity. Median is robust to
+        #     a few bad seed frames; keeping individual refs (not averaging)
+        #     preserves the exact color fingerprint learned from the seed interval.
+        pos_dists = [self._zone_dist(ref, cand_hists) for ref in self._pos_refs]
+        pos_dist  = float(np.median(pos_dists))
+        pos_sim   = float(np.clip(1.0 - pos_dist, 0.0, 1.0))
 
-        # (b) Positive similarity (median distance → similarity)
-        pos_dists = [self._zone_dist(hists, cand_hists)
-                     for hists, _ in self._pos_refs]
-        pos_dist = float(np.median(pos_dists))
-        pos_sim  = float(np.clip(1.0 - pos_dist, 0.0, 1.0))
-
-        # (c) Negative penalty
+        # (b) Negative penalty — if the candidate looks like a known-wrong
+        #     person (collected from other detections in seed frames), reduce
+        #     the score. Works for any color pair: yellow athlete vs yellow
+        #     spectator, white vs white, etc. because the histograms encode
+        #     the exact hue/saturation/value distribution of each person.
         neg_factor = 1.0
         if self._neg_refs:
-            neg_dists = [self._zone_dist(nh, cand_hists) for nh in self._neg_refs]
+            neg_dists    = [self._zone_dist(nh, cand_hists) for nh in self._neg_refs]
             min_neg_dist = float(np.min(neg_dists))
-            neg_sim = float(np.clip(1.0 - min_neg_dist, 0.0, 1.0))
-            # If very similar to a negative, shrink the score
-            neg_factor = float(np.clip(1.0 - neg_sim * 0.60, 0.40, 1.0))
+            neg_sim      = float(np.clip(1.0 - min_neg_dist, 0.0, 1.0))
+            neg_factor   = float(np.clip(1.0 - neg_sim * 0.60, 0.40, 1.0))
 
-        return float(np.clip(pos_sim * ach_factor * neg_factor, 0.0, 1.0))
+        return float(np.clip(pos_sim * neg_factor, 0.0, 1.0))
 
     @property
     def is_ready(self) -> bool:
