@@ -254,6 +254,7 @@ def run_pipeline(
                 "body_height_px":      round(a.body_height_px, 1),
                 "appearance_sim":      (tracker_outputs[i].get("appearance_sim", 0.0)
                                         if i < len(tracker_outputs) else 0.0),
+                "tracking_source":     a.tracking_source,
             }
             for i, a in enumerate(analyses)
         ],

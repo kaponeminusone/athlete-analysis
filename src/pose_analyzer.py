@@ -91,6 +91,10 @@ class FrameAnalysis:
     # "auto" | "bbox_correction" | "click_selection" | "mask_correction"
     correction_source: str = "auto"
 
+    # tracking backend that produced this frame
+    # "bytetrack" | "sot_csrt" | "sot_sam2"
+    tracking_source: str = "bytetrack"
+
 
 def _point(kps_xy, kps_conf, idx) -> Optional[KeypointData]:
     """Extract a single keypoint; return None if below threshold."""

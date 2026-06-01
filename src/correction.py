@@ -27,6 +27,7 @@ from pathlib import Path
 
 from .pose_analyzer   import FrameAnalysis, analyze_frame_from_tracker
 from .athlete_tracker import TrackState, run_tracked_frame, _padded_crop
+from .sot             import SotBackend
 
 
 CorrectionType = Literal["bbox_correction", "click_selection", "mask_correction"]
@@ -221,6 +222,7 @@ def propagate_correction(
     track_state: TrackState,
     radius: int = 15,
     frames_dir: Optional[str] = None,
+    sot: Optional[SotBackend] = None,
 ) -> list[FrameAnalysis]:
     """
     Re-analyze frames [frame_idx - radius .. frame_idx + radius] using
@@ -229,8 +231,11 @@ def propagate_correction(
     Strategy:
       - Backward pass (frame_idx-1 .. frame_idx-radius): appearance model
         is already updated; re-run tracking selection on saved frames.
-      - Forward pass (frame_idx+1 .. frame_idx+radius): stream video from
-        frame_idx+1 and re-run the full tracker with updated appearance.
+        Always uses ByteTrack — SOT is forward-only.
+      - Forward pass (frame_idx+1 .. frame_idx+radius):
+        * If sot is provided: initialize SOT with corrected frame/bbox,
+          then call sot.update() per frame. Pose runs on SOT bbox.
+        * If sot is None (default): re-run the full ByteTrack tracker.
 
     Returns a list of updated FrameAnalysis objects for affected frames,
     NOT including the corrected frame itself (it is already handled).
@@ -239,51 +244,143 @@ def propagate_correction(
     start_f = max(0, corrected_frame_idx - radius)
     end_f   = corrected_frame_idx + radius
 
+    use_sot = sot is not None and corrected_fa.person_bbox is not None
     print(f"  [Propagation] Re-analyzing frames {start_f}–{end_f} "
-          f"(radius={radius}) with updated appearance model ...")
+          f"(radius={radius}, backend={'bytetrack' if not use_sot else sot.tracking_source}) ...")
 
     cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     end_f = min(end_f, total_frames - 1)
 
+    # ── Backward pass: always ByteTrack + appearance ───────────────────────────
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_f)
     frame_idx = start_f
+    while frame_idx < corrected_frame_idx:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        ts = frame_idx / fps
+        tracker_out = run_tracked_frame(
+            image=frame, model_seg=model_seg,
+            state=track_state, frame_idx=frame_idx, model_pose=model_pose,
+        )
+        fa = analyze_frame_from_tracker(frame_idx=frame_idx, timestamp_s=ts,
+                                        tracker_result=tracker_out)
+        if frames_dir:
+            fpath = str(Path(frames_dir) / f"frame_{frame_idx:06d}.jpg")
+            cv2.imwrite(fpath, frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        updated.append(fa)
+        frame_idx += 1
 
+    # ── Forward pass ───────────────────────────────────────────────────────────
+    cap.set(cv2.CAP_PROP_POS_FRAMES, corrected_frame_idx)
+    ret, init_frame = cap.read()   # read corrected frame (to init SOT)
+
+    if use_sot and ret:
+        sot.initialize(init_frame, corrected_fa.person_bbox)
+
+    frame_idx = corrected_frame_idx + 1
     while frame_idx <= end_f:
         ret, frame = cap.read()
         if not ret:
             break
 
-        if frame_idx == corrected_frame_idx:
-            # Skip — already corrected
-            frame_idx += 1
-            continue
-
         ts = frame_idx / fps
-        tracker_out = run_tracked_frame(
-            image=frame,
-            model_seg=model_seg,
-            state=track_state,
-            frame_idx=frame_idx,
-            model_pose=model_pose,
-        )
-        fa = analyze_frame_from_tracker(
-            frame_idx=frame_idx,
-            timestamp_s=ts,
-            tracker_result=tracker_out,
-        )
 
-        # Save updated frame to disk if frames_dir provided
+        if use_sot:
+            fa = _sot_frame(sot, frame, frame_idx, ts, model_pose, track_state)
+        else:
+            tracker_out = run_tracked_frame(
+                image=frame, model_seg=model_seg,
+                state=track_state, frame_idx=frame_idx, model_pose=model_pose,
+            )
+            fa = analyze_frame_from_tracker(frame_idx=frame_idx, timestamp_s=ts,
+                                            tracker_result=tracker_out)
+
         if frames_dir:
             fpath = str(Path(frames_dir) / f"frame_{frame_idx:06d}.jpg")
             cv2.imwrite(fpath, frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
-
         updated.append(fa)
         frame_idx += 1
 
     cap.release()
     print(f"  [Propagation] Done — {len(updated)} frames updated")
     return updated
+
+
+def _sot_frame(
+    sot: SotBackend,
+    frame: np.ndarray,
+    frame_idx: int,
+    timestamp_s: float,
+    model_pose,
+    track_state: TrackState,
+) -> FrameAnalysis:
+    """
+    Run one SOT update and pose estimation, returning a FrameAnalysis.
+    Shared by propagate_correction (forward pass) and any direct SOT calls.
+    """
+    ok, bbox = sot.update(frame, frame_idx)
+    seg_mask  = sot.get_mask(frame_idx)
+    mask_area = int(seg_mask.sum()) if seg_mask is not None else 0
+
+    if not ok:
+        fa = FrameAnalysis(frame_idx=frame_idx, timestamp_s=timestamp_s)
+        fa.tracking_source = sot.tracking_source
+        return fa
+
+    x1, y1, x2, y2 = bbox
+
+    # tighten to mask if available
+    if seg_mask is not None:
+        ys, xs = np.where(seg_mask)
+        if len(xs) > 0:
+            x1, x2 = int(xs.min()), int(xs.max())
+            y1, y2 = int(ys.min()), int(ys.max())
+
+    kps_xy_full = kps_conf = None
+    quality = 0.0
+
+    if model_pose is not None:
+        crop, (ox, oy, _) = _padded_crop(frame, x1, y1, x2, y2)
+        if crop.size > 0:
+            pose_results = model_pose(crop, verbose=False, conf=0.25)
+            if (pose_results and pose_results[0].keypoints is not None
+                    and len(pose_results[0].keypoints.xy) > 0):
+                kp_data  = pose_results[0].keypoints
+                crop_boxes = pose_results[0].boxes
+                best = 0
+                if crop_boxes is not None and len(crop_boxes) > 1:
+                    crop_areas = [(b[2]-b[0])*(b[3]-b[1])
+                                  for b in crop_boxes.xyxy.cpu().numpy()]
+                    best = int(np.argmax(crop_areas))
+                kps_xy_crop = kp_data.xy.cpu().numpy()[best]
+                kps_conf    = kp_data.conf.cpu().numpy()[best]
+                kps_xy_full = kps_xy_crop.copy()
+                kps_xy_full[:, 0] += ox
+                kps_xy_full[:, 1] += oy
+                n_valid = int((kps_conf >= 0.45).sum())
+                quality = round(0.45 * n_valid / 17.0 + 0.55 * min(1.0, mask_area / 30000.0), 3)
+
+    tracker_result = {
+        "found":          True,
+        "track_id":       track_state.athlete_track_id,
+        "bbox":           (x1, y1, x2, y2),
+        "mask_area_px":   mask_area,
+        "crop_offset":    (0, 0),
+        "kps_xy":         kps_xy_full,
+        "kps_conf":       kps_conf,
+        "seg_mask":       seg_mask,
+        "quality_score":  quality,
+        "appearance_sim": 1.0,
+    }
+    fa = analyze_frame_from_tracker(
+        frame_idx=frame_idx,
+        timestamp_s=timestamp_s,
+        tracker_result=tracker_result,
+    )
+    fa.tracking_source = sot.tracking_source
+    return fa
 
 
 def detections_for_frame(

@@ -44,6 +44,7 @@ from src.frame_extractor  import get_video_info
 from src.pose_analyzer    import FrameAnalysis, analyze_frame_from_tracker
 from src.athlete_tracker  import TrackState, run_tracked_frame
 from src.correction       import Correction, apply_correction, propagate_correction, detections_for_frame
+from src.sot              import create_sot
 from src.visualizer       import annotate_frame
 from src.pipeline         import PipelineConfig, run_pipeline
 from src.job_store        import create_job, get_job, list_jobs
@@ -130,6 +131,7 @@ class CorrectionRequest(BaseModel):
     type:                Optional[str] = None   # UI alias for correction_type
     data:                dict  # {"x1","y1","x2","y2"} or {"x","y"} or {"mask":[...]}
     propagation_radius:  int   = 15
+    sot_backend:         str   = "none"         # "none" | "csrt" | "sam2"
 
 
 class CorrectionResponse(BaseModel):
@@ -391,6 +393,14 @@ def correct_frame(req: CorrectionRequest):
     annotated_path = str(out_dir / "annotated" / f"annotated_{req.frame_idx:06d}.jpg")
     annotate_frame(frame_path, corrected_fa, annotated_path)
 
+    # Build optional SOT backend for forward propagation
+    sot = None
+    if req.sot_backend in ("csrt", "sam2"):
+        try:
+            sot = create_sot(req.sot_backend)
+        except Exception as sot_err:
+            print(f"  [SOT] Could not create {req.sot_backend} backend: {sot_err}")
+
     # Propagate to adjacent frames
     info = get_video_info(req.video_path)
     updated_fas = propagate_correction(
@@ -403,6 +413,7 @@ def correct_frame(req: CorrectionRequest):
         track_state=state,
         radius=req.propagation_radius,
         frames_dir=frames_dir,
+        sot=sot,
     )
 
     # Re-annotate updated frames
@@ -426,6 +437,7 @@ def correct_frame(req: CorrectionRequest):
             "usable_for_analysis": fa.usable_for_analysis,
             "manually_corrected":  fa.manually_corrected,
             "correction_source":   fa.correction_source,
+            "tracking_source":     fa.tracking_source,
             "has_mask":            fa.has_mask,
             "mask_area_px":        fa.mask_area_px,
             "annotated_image":     f"/frame/{video_name}/{fa.frame_idx}/annotated",
