@@ -111,7 +111,9 @@ function App() {
   const [correctionMode, setCorrectionMode] = useState("inspect");
   const [sotBackend, setSotBackend] = useState("none");
   const [stride, setStride] = useState(3);
-  const [propagationEndFrame, setPropagationEndFrame] = useState(null); // frame_idx (not array index)
+  const [propagationEndFrame, setPropagationEndFrame] = useState(null);
+  const [isReanalyzing, setIsReanalyzing] = useState(false);
+  const [reanalysisJob, setReanalysisJob] = useState(null); // frame_idx (not array index)
   const [detections, setDetections] = useState([]);
   const [correctionVersion, setCorrectionVersion] = useState(0);
   const videoRef = useRef(null);
@@ -237,6 +239,46 @@ function App() {
       setIsAnalyzing(false);
       setNotice(error.message);
       setNoticeStrong(true);
+    }
+  }
+
+  async function runReanalysis() {
+    const path = project?.video?.path || videoPath;
+    if (!path?.trim()) return;
+    setIsReanalyzing(true);
+    setReanalysisJob(null);
+    try {
+      const result = await fetchJson("/api/reanalyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ video_path: path, stride }),
+      });
+      pollReanalysisJob(result.job_id, path, result.video_name);
+    } catch (error) {
+      setIsReanalyzing(false);
+      setNotice(error.message);
+      setNoticeStrong(true);
+    }
+  }
+
+  async function pollReanalysisJob(jobId, path, refinedName) {
+    try {
+      const job = await fetchJson(`/api/jobs/${jobId}`);
+      setReanalysisJob(job);
+      if (job.status === "running" || job.status === "pending") {
+        setNotice(`[Refinado] ${Math.round(job.percent || 0)}% · ${job.message || "Refinando..."}`);
+        window.setTimeout(() => pollReanalysisJob(jobId, path, refinedName), 600);
+        return;
+      }
+      setIsReanalyzing(false);
+      if (job.status === "done") {
+        setNotice("Refinado completo. Puedes abrir el proyecto _refined desde Medios.");
+      } else {
+        setNotice(job.error || "Refinado falló.");
+        setNoticeStrong(true);
+      }
+    } catch {
+      window.setTimeout(() => pollReanalysisJob(jobId, path, refinedName), 1000);
     }
   }
 
@@ -439,6 +481,9 @@ function App() {
                 isAnalyzing={isAnalyzing}
                 analysisJob={analysisJob}
                 analysisLog={analysisLog}
+                onRunReanalysis={runReanalysis}
+                isReanalyzing={isReanalyzing}
+                reanalysisJob={reanalysisJob}
                 correctionMode={correctionMode}
                 setCorrectionMode={setCorrectionMode}
                 sotBackend={sotBackend}
@@ -1048,6 +1093,9 @@ function Inspector({
   isAnalyzing,
   analysisJob,
   analysisLog,
+  onRunReanalysis,
+  isReanalyzing,
+  reanalysisJob,
   correctionMode,
   setCorrectionMode,
   sotBackend,
@@ -1205,7 +1253,31 @@ function Inspector({
           <div className="p-2 text-slate-500">No hay analysis.json para este video.</div>
         )}
       </div>
-      {analysisLog ? <pre className="m-2 max-h-56 overflow-auto bg-black p-2 text-[11px] text-slate-300">{analysisLog}</pre> : null}
+      {analysisLog ? <pre className="m-2 max-h-32 overflow-auto bg-black p-2 text-[11px] text-slate-300">{analysisLog}</pre> : null}
+
+      {/* Refined reanalysis */}
+      {analysisExists ? (
+        <div className="mt-2 px-2">
+          <div className="mb-1 flex items-center justify-between">
+            <span className="text-[11px] font-bold uppercase text-slate-300">Segunda pasada</span>
+            <button
+              className="h-6 border border-purple-600 bg-purple-900/30 px-2 text-[11px] text-purple-300 disabled:opacity-40"
+              type="button"
+              disabled={isReanalyzing || isAnalyzing}
+              onClick={onRunReanalysis}
+              title="Re-analiza usando el modelo de apariencia calibrado (sin ByteTrack)"
+            >
+              {isReanalyzing ? "Refinando…" : "Refinar"}
+            </button>
+          </div>
+          <p className="text-[10px] leading-4 text-slate-500">
+            Usa los mejores frames del análisis existente para calibrar el modelo de apariencia,
+            luego re-corre seg+pose en todo el video sin ByteTrack.
+            Resultado en <em>output/_refined/</em>
+          </p>
+          {isReanalyzing ? <AnalysisProgress job={reanalysisJob} /> : null}
+        </div>
+      ) : null}
     </aside>
   );
 }

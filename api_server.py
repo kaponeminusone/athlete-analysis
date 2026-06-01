@@ -48,6 +48,7 @@ from src.sot              import create_sot
 from src.visualizer       import annotate_frame
 from src.pipeline         import PipelineConfig, run_pipeline
 from src.job_store        import create_job, get_job, list_jobs
+from src.reanalyzer       import ReanalysisConfig, run_reanalysis
 
 OUTPUT_ROOT = Path("output")
 app = FastAPI(title="Triple Jump Analyzer API")
@@ -310,6 +311,71 @@ def analyze_video(req: AnalyzeRequest):
 @app.post("/api/analyze")
 def analyze_video_api(req: AnalyzeRequest):
     return _start_analysis_job(req)
+
+
+class ReanalyzeRequest(BaseModel):
+    video_path: str
+    stride:     int   = 1
+    start_sec:  float = 0.0
+    end_sec:    Optional[float] = None
+    seed_frames: int  = 15
+
+
+@app.post("/api/reanalyze")
+def reanalyze_video(req: ReanalyzeRequest):
+    """
+    Second-pass reanalysis: seeds AppearanceModel from first-pass best
+    frames, then re-runs seg+pose on the full video using appearance-only
+    athlete selection (no ByteTrack).  Results go to output/<name>_refined/.
+    Requires a completed first-pass analysis.json.
+    """
+    if not Path(req.video_path).exists():
+        raise HTTPException(404, f"Video not found: {req.video_path}")
+
+    video_name      = _video_name(req.video_path)
+    original_outdir = str(OUTPUT_ROOT / video_name)
+    refined_outdir  = str(OUTPUT_ROOT / f"{video_name}_refined")
+
+    if not (Path(original_outdir) / "analysis.json").exists():
+        raise HTTPException(
+            400,
+            f"No first-pass analysis found at {original_outdir}/analysis.json. "
+            "Run /api/analyze first."
+        )
+
+    job = create_job()
+    job.update({"result_video_name": f"{video_name}_refined"})
+    job.start()
+
+    config = ReanalysisConfig(
+        video_path=req.video_path,
+        original_output_dir=original_outdir,
+        output_dir=refined_outdir,
+        stride=req.stride,
+        start_sec=req.start_sec,
+        end_sec=req.end_sec,
+        seed_frames=req.seed_frames,
+        annotate_every=1,
+    )
+
+    def _run():
+        import warnings
+        warnings.filterwarnings("ignore")
+        try:
+            run_reanalysis(config, on_progress=job.update)
+            job.finish(f"{video_name}_refined")
+        except Exception as exc:
+            job.fail(str(exc))
+
+    threading.Thread(target=_run, daemon=True).start()
+
+    return {
+        "job_id":     job.job_id,
+        "video_name": f"{video_name}_refined",
+        "status":     "started",
+        "poll":       f"/api/jobs/{job.job_id}",
+        "output_dir": refined_outdir,
+    }
 
 
 @app.get("/api/jobs/{job_id}")
