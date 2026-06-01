@@ -109,6 +109,8 @@ function App() {
   const [isCorrecting, setIsCorrecting] = useState(false);
   const [isLoadingDetections, setIsLoadingDetections] = useState(false);
   const [correctionMode, setCorrectionMode] = useState("inspect");
+  const [sotBackend, setSotBackend] = useState("none");
+  const [stride, setStride] = useState(3);
   const [detections, setDetections] = useState([]);
   const [correctionVersion, setCorrectionVersion] = useState(0);
   const videoRef = useRef(null);
@@ -122,6 +124,16 @@ function App() {
   useEffect(() => {
     loadVideos();
   }, []);
+
+  useEffect(() => {
+    function onKey(e) {
+      if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA" || e.target.tagName === "SELECT") return;
+      if (e.key === "ArrowRight") { e.preventDefault(); selectFrame(frameIndex + 1); }
+      if (e.key === "ArrowLeft")  { e.preventDefault(); selectFrame(frameIndex - 1); }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [frameIndex, frames]);
 
   const sampledFrames = useMemo(
     () =>
@@ -216,7 +228,7 @@ function App() {
       const result = await fetchJson("/api/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ video_path: path }),
+        body: JSON.stringify({ video_path: path, stride }),
       });
       setAnalysisLog(`Analisis iniciado. Job: ${result.job_id}\n`);
       pollAnalysisJob(result.job_id, path);
@@ -254,6 +266,7 @@ function App() {
           type,
           data,
           propagation_radius: 15,
+          sot_backend: sotBackend,
         }),
       });
       await refreshProject(project.video.path);
@@ -425,6 +438,10 @@ function App() {
                 analysisLog={analysisLog}
                 correctionMode={correctionMode}
                 setCorrectionMode={setCorrectionMode}
+                sotBackend={sotBackend}
+                setSotBackend={setSotBackend}
+                stride={stride}
+                setStride={setStride}
                 onLoadDetections={loadDetections}
                 isCorrecting={isCorrecting}
                 isLoadingDetections={isLoadingDetections}
@@ -913,8 +930,13 @@ function Timeline({ frames, currentIndex, onSelect, duration }) {
   const total = duration || frames.at(-1)?.timestamp_s || frames.length;
   const currentFrame = frames[currentIndex];
 
+  function handleWheel(e) {
+    e.preventDefault();
+    onSelect(currentIndex + (e.deltaY > 0 ? 1 : -1));
+  }
+
   return (
-    <div className="relative m-2 overflow-hidden border border-editor-600 bg-editor-850">
+    <div className="relative m-2 overflow-hidden border border-editor-600 bg-editor-850" onWheel={handleWheel}>
       {/* Header con leyenda */}
       <div className="absolute left-2 top-1 z-10 flex items-center gap-3 text-[10px] text-slate-500">
         <span className="uppercase">Timeline</span>
@@ -998,6 +1020,10 @@ function Inspector({
   analysisLog,
   correctionMode,
   setCorrectionMode,
+  sotBackend,
+  setSotBackend,
+  stride,
+  setStride,
   onLoadDetections,
   isCorrecting,
   isLoadingDetections,
@@ -1062,20 +1088,50 @@ function Inspector({
         <p className="mt-2 text-[11px] leading-4 text-slate-500">
           Click manda coordenadas. Bounding box arrastra un rectangulo. Mask brush pinta y luego aplica.
         </p>
+        <div className="mt-3">
+          <label className="mb-1 block text-[10px] font-bold uppercase text-slate-500">
+            Propagacion despues de corregir
+          </label>
+          <select
+            className="h-7 w-full border border-editor-600 bg-editor-850 px-2 text-[11px] text-slate-200 outline-none focus:border-accent"
+            value={sotBackend}
+            onChange={(event) => setSotBackend(event.target.value)}
+            disabled={isCorrecting}
+          >
+            <option value="none">ByteTrack + appearance</option>
+            <option value="csrt">SOT CSRT/MIL</option>
+            <option value="sam2">SOT SAM2</option>
+          </select>
+          <p className="mt-1 text-[10px] leading-4 text-slate-500">
+            CSRT usa fallback MIL si no hay opencv-contrib. SAM2 requiere checkpoint instalado.
+          </p>
+        </div>
       </div>
 
-      <div className="mt-2 flex items-center justify-between px-2">
-        <div className="text-[11px] font-bold uppercase text-slate-300">Analisis</div>
-        {!analysisExists ? (
+      <div className="mt-2 px-2">
+        <div className="mb-1 text-[11px] font-bold uppercase text-slate-300">Analisis</div>
+        <div className="flex items-center gap-2">
+          <label className="text-[10px] uppercase text-slate-500 shrink-0">Stride</label>
+          <select
+            className="h-6 flex-1 border border-editor-600 bg-editor-850 px-1 text-[11px] text-slate-200 outline-none focus:border-accent"
+            value={stride}
+            onChange={(e) => setStride(Number(e.target.value))}
+            disabled={isAnalyzing}
+          >
+            <option value={1}>1 — todos los frames</option>
+            <option value={2}>2 — cada 2</option>
+            <option value={3}>3 — cada 3 (rápido)</option>
+            <option value={5}>5 — cada 5</option>
+          </select>
           <button
-            className="h-6 border border-editor-600 bg-editor-850 px-2 text-[11px]"
+            className="h-6 shrink-0 border border-editor-600 bg-editor-850 px-2 text-[11px] disabled:opacity-50"
             type="button"
             disabled={isAnalyzing}
             onClick={onRunAnalysis}
           >
-            {isAnalyzing ? "Generando" : "Generar"}
+            {isAnalyzing ? "Generando…" : "Generar"}
           </button>
-        ) : null}
+        </div>
       </div>
       {isAnalyzing ? <AnalysisProgress job={analysisJob} /> : null}
       <div className="mt-2 grid border-y border-editor-700">
@@ -1162,6 +1218,7 @@ function DetectionDataPanel({ frame, compact = false }) {
     ["Tiempo", formatTime(frame?.timestamp_s)],
     ["Persona detectada", frame?.person_detected ? "Si" : "No"],
     ["Track ID", frame?.track_id ?? "N/A"],
+    ["Tracking source", frame?.tracking_source || "bytetrack"],
     ["BBox", bboxText],
     ["Area bbox", frame?.person_bbox_area ? `${Math.round(frame.person_bbox_area)} px` : "N/A"],
     ["Mascara", frame?.has_mask ? "Si" : "No"],
