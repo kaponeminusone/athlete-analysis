@@ -726,6 +726,7 @@ function ViewerPanel({
   const [dragBox, setDragBox] = useState(null);
   const [maskPoints, setMaskPoints] = useState([]);
   const [isPainting, setIsPainting] = useState(false);
+  const [debugUrl, setDebugUrl] = useState(null);
   const stageRef = useRef(null);
 
   useEffect(() => {
@@ -733,6 +734,7 @@ function ViewerPanel({
     setDragBox(null);
     setMaskPoints([]);
     setIsPainting(false);
+    setDebugUrl(null);
   }, [currentFrame?.frame_idx, correctionMode]);
 
   function mediaMetrics() {
@@ -829,6 +831,20 @@ function ViewerPanel({
     onSubmitCorrection("mask_correction", { mask });
     setMaskPoints([]);
     setIsPainting(false);
+  }
+
+  function validateBox() {
+    if (!dragBox || !currentFrame || !project?.video?.path) return;
+    const x1 = Math.round(Math.min(dragBox.start.x, dragBox.end.x));
+    const y1 = Math.round(Math.min(dragBox.start.y, dragBox.end.y));
+    const x2 = Math.round(Math.max(dragBox.start.x, dragBox.end.x));
+    const y2 = Math.round(Math.max(dragBox.start.y, dragBox.end.y));
+    const url = apiUrl("/api/debug_coords", {
+      video_path: project.video.path,
+      frame_idx: currentFrame.frame_idx,
+      x1, y1, x2, y2,
+    });
+    setDebugUrl(url.toString() + "&t=" + Date.now());
   }
 
   function handlePointerDown(event) {
@@ -956,6 +972,37 @@ function ViewerPanel({
           onSubmitMask={submitMask}
           onClearMask={() => setMaskPoints([])}
         />
+
+        {/* Validate button — shown when a bbox is drawn */}
+        {correctionMode === "bbox_correction" && dragBox && !isCorrecting ? (
+          <button
+            className="absolute bottom-2 right-2 z-50 border border-yellow-500 bg-yellow-900/80 px-3 py-1 text-[11px] text-yellow-200 hover:bg-yellow-800"
+            type="button"
+            onClick={validateBox}
+          >
+            Validar coords
+          </button>
+        ) : null}
+
+        {/* Debug overlay — full-frame image with server-drawn bbox */}
+        {debugUrl ? (
+          <div
+            className="absolute inset-0 z-50 flex flex-col bg-black/90"
+            onClick={() => setDebugUrl(null)}
+          >
+            <div className="shrink-0 bg-yellow-900/80 px-3 py-1 text-[11px] text-yellow-200">
+              Validacion del servidor — las coords que recibio dibujadas sobre el frame real.
+              Si el recuadro rojo coincide con tu seleccion, el mapeo es correcto.
+              Click para cerrar.
+            </div>
+            <img
+              className="min-h-0 flex-1 object-contain"
+              src={debugUrl}
+              alt="debug coords"
+              onClick={(e) => e.stopPropagation()}
+            />
+          </div>
+        ) : null}
       </div>
 
       <div className="flex items-center gap-1.5 border-y border-editor-700 bg-editor-850 px-2">
