@@ -153,61 +153,71 @@ def annotate_frame(
     cv2.addWeighted(overlay, 0.75, img, 0.25, 0, img)
 
     y = 20
-    # Row 1 — camera angle
+
+    # ── Row 1 — detection type (prominent, replaces the old "Angle" header) ────
+    src = getattr(analysis, "tracking_source", "bytetrack")
+    src_labels = {
+        "bytetrack": "ByteTrack",
+        "sot_csrt":  "SOT:CSRT",
+        "sot_sam2":  "SOT:SAM2",
+    }
+    src_colors = {
+        "bytetrack": (140, 140, 140),
+        "sot_csrt":  (60,  220, 255),
+        "sot_sam2":  (80,  255, 160),
+    }
+    src_label = src_labels.get(src, src)
+    src_color = src_colors.get(src, (140, 140, 140))
+
+    if analysis.manually_corrected:
+        ct = analysis.correction_source or "manual"
+        ct_display = {
+            "bbox_correction":  "BBOX",
+            "click_selection":  "CLICK",
+            "mask_correction":  "MASK",
+        }.get(ct, ct.upper())
+        det_label = f"CORREGIDO [{ct_display}]  {src_label}"
+        det_color = (60, 80, 255)
+        # solid filled bar so it stands out
+        (tw, th), _ = cv2.getTextSize(det_label, cv2.FONT_HERSHEY_SIMPLEX, 0.60, 2)
+        cv2.rectangle(img, (6, y - th - 4), (panel_w - 6, y + 4), det_color, -1)
+        cv2.putText(img, det_label, (10, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.60, (255, 255, 255), 2, cv2.LINE_AA)
+        y += th + 10
+    else:
+        y += _text(img, src_label, (8, y), src_color, 0.60, 2)
+
+    # ── Row 2 — camera angle ──────────────────────────────────────────────────
     angle_label = analysis.camera_angle.value
     usable_tag  = "  [USABLE]" if analysis.usable_for_analysis else "  [skip]"
-    y += _text(img, f"Angle: {angle_label}{usable_tag}", (8, y), angle_color, 0.60, 2)
+    y += _text(img, f"Angle: {angle_label}{usable_tag}", (8, y), angle_color, 0.50, 1)
 
-    # Row 2 — track ID + appearance
+    # ── Row 3 — track ID + appearance ────────────────────────────────────────
     tid_str = f"Track ID: {analysis.track_id}" if analysis.track_id is not None else "Track ID: --"
     app_str = f"  Appear: {appearance_sim:.0%}" if appearance_sim > 0 else ""
     y += _text(img, tid_str + app_str, (8, y), (200, 200, 200), 0.50, 1)
 
-    # Row 3 — quality score with colored bar
+    # ── Row 4 — quality score with colored bar ────────────────────────────────
     q = analysis.quality_score
     q_color = (60, 220, 60) if q >= 0.70 else (60, 180, 255) if q >= 0.50 else (60, 60, 220)
     y += _text(img, f"Quality: {q:.2f}/1.00", (8, y), q_color, 0.50, 1)
 
-    # Quality bar
     bar_x, bar_y, bar_w, bar_h = 8, y, 180, 7
     cv2.rectangle(img, (bar_x, bar_y), (bar_x+bar_w, bar_y+bar_h), (50,50,50), -1)
     fill = int(np.clip(q, 0, 1) * bar_w)
     cv2.rectangle(img, (bar_x, bar_y), (bar_x+fill, bar_y+bar_h), q_color, -1)
     y += bar_h + 6
 
-    # Row 4 — keypoints
+    # ── Row 5 — keypoints ─────────────────────────────────────────────────────
     kp_str = f"Keypoints: {analysis.keypoints_valid_count}/11 valid"
     y += _text(img, kp_str, (8, y), (200, 200, 200), 0.50, 1)
 
-    # Row 5 — shoulder ratio + mask
+    # ── Row 6 — shoulder ratio + mask ─────────────────────────────────────────
     ratio_str = f"Shoulder ratio: {analysis.shoulder_ratio:.2f}"
     mask_str  = f"  Mask: {analysis.mask_area_px:,}px" if analysis.mask_area_px > 0 else ""
     y += _text(img, ratio_str + mask_str, (8, y), (180, 180, 180), 0.45, 1)
 
-    # Row 6 — tracking source / correction badge
-    src = getattr(analysis, "tracking_source", "bytetrack")
-    src_colors = {
-        "bytetrack": (140, 140, 140),
-        "sot_csrt":  (60,  220, 255),   # cyan
-        "sot_sam2":  (80,  255, 160),   # mint
-    }
-    src_label = {"bytetrack": "ByteTrack", "sot_csrt": "SOT:CSRT", "sot_sam2": "SOT:SAM2"}.get(src, src)
-    src_color = src_colors.get(src, (140, 140, 140))
-
-    if analysis.manually_corrected:
-        ct = analysis.correction_source or "manual"
-        badge_label = f"CORREGIDO [{ct}]  {src_label}"
-        badge_color = (60, 80, 255)   # red-ish
-        # draw a highlighted background bar for visibility
-        bh_y = y - 2
-        cv2.rectangle(img, (6, bh_y - 2), (panel_w - 6, bh_y + 16), badge_color, -1)
-        cv2.putText(img, badge_label, (10, bh_y + 12),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
-        y += 20
-    else:
-        y += _text(img, src_label, (8, y), src_color, 0.45, 1)
-
-    # Row 7 — frame / timestamp
+    # ── Row 7 — frame / timestamp ─────────────────────────────────────────────
     _text(img, f"Frame {analysis.frame_idx:06d}  t={analysis.timestamp_s:.2f}s",
           (8, y), (140, 140, 140), 0.45, 1)
 
