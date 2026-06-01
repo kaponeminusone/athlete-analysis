@@ -38,7 +38,7 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from .athlete_tracker import AppearanceModel, _padded_crop, MIN_BBOX_AREA
+from .athlete_tracker import _padded_crop, MIN_BBOX_AREA
 from .frame_extractor import get_video_info
 from .job_store import ProgressCallback, noop_progress
 from .pose_analyzer import (
@@ -49,9 +49,160 @@ from .pose_analyzer import (
 from .visualizer import annotate_frame
 
 SEED_MIN_QUALITY = 0.65
-SEED_MAX_FRAMES  = 15       # how many best frames to use for seeding
-MIN_SIMILARITY   = 0.30     # Bhattacharyya-based; 0 = identical, lower = better match
-                             # we keep detections where similarity() >= MIN_SIMILARITY
+SEED_MAX_FRAMES  = 15
+MIN_SIMILARITY   = 0.25     # minimum to accept a match
+
+
+# ─── Robust appearance model ──────────────────────────────────────────────────
+
+class RobustAppearanceModel:
+    """
+    Improved appearance model for second-pass reanalysis.
+
+    Key improvements over the basic AppearanceModel:
+
+    1. Zone-based histograms — the person bbox is split into three vertical
+       bands (head 0-25%, torso 25-70%, legs 70-100%) and each gets its own
+       histogram. Torso weight is 0.60 (most discriminative for clothing).
+
+    2. Finer hue bins (32 instead of 8) — better separates e.g. white from
+       cream, or the exact red hue from orange.
+
+    3. Achromatic ratio — fraction of pixels with saturation < 40. A white
+       sweater scores ~0.80; a red/blue sweater scores ~0.10. This single
+       number is very discriminative and is compared before the histograms.
+
+    4. Reference set instead of averaged model — keeps the last MAX_REFS
+       individual zone-histogram tuples and uses the MEDIAN distance across
+       all of them. Averaging destroys color distinctiveness.
+
+    5. Negative examples — histograms of OTHER persons detected in the same
+       seed frames. During matching, candidates that look like a known-wrong
+       person are penalized.
+    """
+
+    ZONE_BOUNDS  = [(0.00, 0.25), (0.25, 0.70), (0.70, 1.00)]
+    ZONE_WEIGHTS = [0.10,          0.60,          0.30]
+    BINS_H, BINS_S, BINS_V = 32, 8, 8
+    SAT_ACHROMATIC = 40      # pixels with S < this are "achromatic" (white/gray/black)
+    MAX_REFS = 20
+    MAX_NEGS = 15
+
+    def __init__(self) -> None:
+        self._pos_refs:  list[tuple[list[np.ndarray], float]] = []  # (zone_hists, achromatic_ratio)
+        self._neg_refs:  list[list[np.ndarray]] = []
+
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
+    def _zone_features(self, img: np.ndarray,
+                        mask: Optional[np.ndarray],
+                        bbox: tuple) -> tuple[list[np.ndarray], float]:
+        """Compute per-zone histograms + overall achromatic ratio."""
+        x1, y1, x2, y2 = (int(v) for v in bbox)
+        bh = max(y2 - y1, 1)
+        h, w = img.shape[:2]
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        hists: list[np.ndarray] = []
+        ach_vals: list[float] = []
+
+        for (z0, z1) in self.ZONE_BOUNDS:
+            zy1 = max(0, y1 + int(bh * z0))
+            zy2 = min(h, y1 + int(bh * z1))
+            zm = np.zeros((h, w), dtype=np.uint8)
+            if mask is not None:
+                zm[zy1:zy2, x1:x2] = (mask[zy1:zy2, x1:x2].astype(np.uint8)) * 255
+            else:
+                zm[zy1:zy2, x1:x2] = 255
+
+            n_px = int(zm.sum() / 255)
+            if n_px < 20:
+                hists.append(np.zeros(self.BINS_H * self.BINS_S * self.BINS_V, dtype=np.float32))
+                continue
+
+            hist = cv2.calcHist([hsv], [0, 1, 2], zm,
+                                [self.BINS_H, self.BINS_S, self.BINS_V],
+                                [0, 180, 0, 256, 0, 256])
+            cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
+            hists.append(hist.flatten().astype(np.float32))
+
+            sat = hsv[zm > 0, 1]
+            ach_vals.append(float((sat < self.SAT_ACHROMATIC).mean()))
+
+        achromatic = float(np.mean(ach_vals)) if ach_vals else 0.5
+        return hists, achromatic
+
+    def _zone_dist(self, hists_a: list[np.ndarray],
+                   hists_b: list[np.ndarray]) -> float:
+        """Weighted Bhattacharyya distance across zones."""
+        total = 0.0
+        for h_a, h_b, w in zip(hists_a, hists_b, self.ZONE_WEIGHTS):
+            if h_a.sum() == 0 or h_b.sum() == 0:
+                total += 0.5 * w
+                continue
+            d = cv2.compareHist(h_a, h_b, cv2.HISTCMP_BHATTACHARYYA)
+            total += float(d) * w
+        return total
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def add_positive(self, img: np.ndarray,
+                     mask: Optional[np.ndarray], bbox: tuple) -> None:
+        hists, ach = self._zone_features(img, mask, bbox)
+        self._pos_refs.append((hists, ach))
+        if len(self._pos_refs) > self.MAX_REFS:
+            self._pos_refs.pop(0)
+
+    def add_negative(self, img: np.ndarray,
+                     mask: Optional[np.ndarray], bbox: tuple) -> None:
+        hists, _ = self._zone_features(img, mask, bbox)
+        self._neg_refs.append(hists)
+        if len(self._neg_refs) > self.MAX_NEGS:
+            self._neg_refs.pop(0)
+
+    def similarity(self, img: np.ndarray,
+                   mask: Optional[np.ndarray], bbox: tuple) -> float:
+        """
+        Returns score 0–1 (1 = identical to references).
+
+        Steps:
+          a) Achromatic pre-filter: if the candidate's achromatic ratio
+             differs too much from the reference average, penalise hard.
+          b) Positive similarity: median Bhattacharyya distance across all
+             positive references (median is robust to outlier seed frames).
+          c) Negative penalty: if candidate looks like a known-wrong person,
+             reduce the score proportionally.
+        """
+        if not self._pos_refs:
+            return 0.5
+
+        cand_hists, cand_ach = self._zone_features(img, mask, bbox)
+
+        # (a) Achromatic ratio comparison
+        ref_ach = float(np.mean([r[1] for r in self._pos_refs]))
+        ach_diff = abs(ref_ach - cand_ach)
+        # Full penalty at diff >= 0.50, none at diff == 0
+        ach_factor = float(np.clip(1.0 - ach_diff * 2.0, 0.0, 1.0))
+
+        # (b) Positive similarity (median distance → similarity)
+        pos_dists = [self._zone_dist(hists, cand_hists)
+                     for hists, _ in self._pos_refs]
+        pos_dist = float(np.median(pos_dists))
+        pos_sim  = float(np.clip(1.0 - pos_dist, 0.0, 1.0))
+
+        # (c) Negative penalty
+        neg_factor = 1.0
+        if self._neg_refs:
+            neg_dists = [self._zone_dist(nh, cand_hists) for nh in self._neg_refs]
+            min_neg_dist = float(np.min(neg_dists))
+            neg_sim = float(np.clip(1.0 - min_neg_dist, 0.0, 1.0))
+            # If very similar to a negative, shrink the score
+            neg_factor = float(np.clip(1.0 - neg_sim * 0.60, 0.40, 1.0))
+
+        return float(np.clip(pos_sim * ach_factor * neg_factor, 0.0, 1.0))
+
+    @property
+    def is_ready(self) -> bool:
+        return len(self._pos_refs) >= 2
 
 
 @dataclass
@@ -77,7 +228,7 @@ def _seed_appearance(
     on_progress: ProgressCallback = noop_progress,
     seed_start_frame: Optional[int] = None,
     seed_end_frame:   Optional[int] = None,
-) -> Optional[AppearanceModel]:
+) -> Optional[RobustAppearanceModel]:
     """
     Build an AppearanceModel from the N highest-quality frames of the
     first-pass analysis.  Re-runs YOLO seg (no tracking) to get bboxes.
@@ -149,10 +300,11 @@ def _seed_appearance(
         return None
 
     frames_dir = Path(original_output_dir) / "frames"
-    model = AppearanceModel()
+    model  = RobustAppearanceModel()
     seeded = 0
+    negs   = 0
 
-    for i, fr in enumerate(seed_candidates):
+    for fr in seed_candidates:
         fidx  = fr["frame_idx"]
         fpath = frames_dir / f"frame_{fidx:06d}.jpg"
         if not fpath.exists():
@@ -162,8 +314,8 @@ def _seed_appearance(
         if img is None:
             continue
 
-        # Run seg (plain, no track) to get per-person bboxes
-        results = model_seg(img, classes=[0], conf=0.35, verbose=False)
+        # Run seg (plain, no track)
+        results = model_seg(img, classes=[0], conf=0.30, verbose=False)
         if not results or results[0].boxes is None:
             continue
 
@@ -174,31 +326,35 @@ def _seed_appearance(
         if not valid:
             continue
 
-        # pick largest detection (most likely the athlete in a seed frame)
+        def _get_mask(idx):
+            if res.masks is not None and idx < len(res.masks.data):
+                mt = res.masks.data[idx].cpu().numpy()
+                return cv2.resize(mt, (img.shape[1], img.shape[0]),
+                                  interpolation=cv2.INTER_NEAREST).astype(bool)
+            return None
+
+        # Largest detection = positive (most prominent person in a seed frame)
         best = max(valid, key=lambda i: areas[i])
         bbox = tuple(int(v) for v in bboxes[best])
-
-        seg_mask = None
-        if res.masks is not None and best < len(res.masks.data):
-            mt = res.masks.data[best].cpu().numpy()
-            seg_mask = cv2.resize(
-                mt, (img.shape[1], img.shape[0]),
-                interpolation=cv2.INTER_NEAREST,
-            ).astype(bool)
-
-        model.update(img, mask=seg_mask, bbox=bbox)
+        model.add_positive(img, _get_mask(best), bbox)
         seeded += 1
+
+        # All other detections in this frame = negative examples
+        for j in valid:
+            if j != best:
+                model.add_negative(img, _get_mask(j), tuple(int(v) for v in bboxes[j]))
+                negs += 1
 
         on_progress({
             "stage":   "seeding",
-            "message": f"Semilla {seeded}/{len(seed_candidates)} — frame {fidx} Q={fr['quality_score']:.2f}",
+            "message": f"Semilla {seeded}/{len(seed_candidates)} — frame {fidx}  Q={fr.get('quality_score',0):.2f}",
             "percent": 10.0 + 10.0 * (seeded / len(seed_candidates)),
         })
 
     if seeded == 0:
         return None
 
-    print(f"  [Reanalyzer] AppearanceModel seeded from {seeded} frames")
+    print(f"  [Reanalyzer] RobustAppearanceModel: {seeded} positivos + {negs} negativos")
     return model
 
 
@@ -210,7 +366,7 @@ def _analyze_frame_refined(
     timestamp_s: float,
     model_seg,
     model_pose,
-    appearance: AppearanceModel,
+    appearance: RobustAppearanceModel,
 ) -> FrameAnalysis:
     """
     Run seg (no tracking) → pick best appearance match → pose on crop.
@@ -301,10 +457,15 @@ def _analyze_frame_refined(
                 3,
             )
 
-    # Update appearance model from high-confidence frames
+    # Reinforce appearance model from high-confidence frames;
+    # also add the rejected detections as new negatives
     det_conf = float(confs[best_i])
-    if det_conf >= 0.60 and mask_area > 8000:
-        appearance.update(image, mask=seg_mask, bbox=(x1, y1, x2, y2))
+    if det_conf >= 0.65 and mask_area > 8000 and best_sim >= 0.50:
+        appearance.add_positive(image, seg_mask, (x1, y1, x2, y2))
+    for j, _ in scores:
+        if j != best_i and best_sim > 0.50:
+            bj = tuple(int(v) for v in bboxes[j])
+            appearance.add_negative(image, det_masks[j], bj)
 
     tracker_result = {
         "found":          True,
