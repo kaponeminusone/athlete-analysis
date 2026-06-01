@@ -113,7 +113,8 @@ function App() {
   const [stride, setStride] = useState(3);
   const [propagationEndFrame, setPropagationEndFrame] = useState(null);
   const [isReanalyzing, setIsReanalyzing] = useState(false);
-  const [reanalysisJob, setReanalysisJob] = useState(null); // frame_idx (not array index)
+  const [reanalysisJob, setReanalysisJob] = useState(null);
+  const [refinedOutputDir, setRefinedOutputDir] = useState(null);
   const [detections, setDetections] = useState([]);
   const [correctionVersion, setCorrectionVersion] = useState(0);
   const videoRef = useRef(null);
@@ -251,13 +252,26 @@ function App() {
     if (!path?.trim()) return;
     setIsReanalyzing(true);
     setReanalysisJob(null);
+    setRefinedOutputDir(null);
+
+    // Use Shift+Click range as seed interval when both bounds are set
+    const currentFrameIdx = currentFrame?.frame_idx ?? null;
+    const seedStart = (propagationEndFrame !== null && currentFrameIdx !== null && currentFrameIdx < propagationEndFrame)
+      ? currentFrameIdx : null;
+    const seedEnd   = seedStart !== null ? propagationEndFrame : null;
+
     try {
       const result = await fetchJson("/api/reanalyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ video_path: path, stride }),
+        body: JSON.stringify({
+          video_path: path,
+          stride,
+          seed_start_frame: seedStart,
+          seed_end_frame:   seedEnd,
+        }),
       });
-      pollReanalysisJob(result.job_id, path, result.video_name);
+      pollReanalysisJob(result.job_id, path, result.output_dir);
     } catch (error) {
       setIsReanalyzing(false);
       setNotice(error.message);
@@ -265,25 +279,39 @@ function App() {
     }
   }
 
-  async function pollReanalysisJob(jobId, path, refinedName) {
+  async function pollReanalysisJob(jobId, path, outputDir) {
     try {
       const job = await fetchJson(`/api/jobs/${jobId}`);
       setReanalysisJob(job);
       if (job.status === "running" || job.status === "pending") {
         setNotice(`[Refinado] ${Math.round(job.percent || 0)}% · ${job.message || "Refinando..."}`);
-        window.setTimeout(() => pollReanalysisJob(jobId, path, refinedName), 600);
+        window.setTimeout(() => pollReanalysisJob(jobId, path, outputDir), 600);
         return;
       }
       setIsReanalyzing(false);
       if (job.status === "done") {
-        setNotice("Refinado completo. Puedes abrir el proyecto _refined desde Medios.");
+        setRefinedOutputDir(outputDir || null);
+        setNotice("Refinado completo. Abre el resultado con el botón de abajo.");
       } else {
         setNotice(job.error || "Refinado falló.");
         setNoticeStrong(true);
       }
     } catch {
-      window.setTimeout(() => pollReanalysisJob(jobId, path, refinedName), 1000);
+      window.setTimeout(() => pollReanalysisJob(jobId, path, outputDir), 1000);
     }
+  }
+
+  async function openRefinedProject() {
+    const path = project?.video?.path || videoPath;
+    if (!path || !refinedOutputDir) return;
+    const url = apiUrl("/api/project", { video_path: path, output_dir: refinedOutputDir });
+    const nextProject = await fetchJson(url).catch((e) => { setNotice(e.message); setNoticeStrong(true); return null; });
+    if (!nextProject) return;
+    setProject(nextProject);
+    setFrameIndex(0);
+    setMode("annotation");
+    setNotice("Proyecto refinado cargado.");
+    setNoticeStrong(false);
   }
 
   async function refreshProject(path = project?.video?.path || videoPath) {
@@ -488,6 +516,8 @@ function App() {
                 onRunReanalysis={runReanalysis}
                 isReanalyzing={isReanalyzing}
                 reanalysisJob={reanalysisJob}
+                refinedOutputDir={refinedOutputDir}
+                onOpenRefined={openRefinedProject}
                 correctionMode={correctionMode}
                 setCorrectionMode={setCorrectionMode}
                 sotBackend={sotBackend}
@@ -1120,6 +1150,8 @@ function Inspector({
   onRunReanalysis,
   isReanalyzing,
   reanalysisJob,
+  refinedOutputDir,
+  onOpenRefined,
   correctionMode,
   setCorrectionMode,
   sotBackend,
@@ -1284,20 +1316,32 @@ function Inspector({
         <div className="mt-2 px-2">
           <div className="mb-1 flex items-center justify-between">
             <span className="text-[11px] font-bold uppercase text-slate-300">Segunda pasada</span>
-            <button
-              className="h-6 border border-purple-600 bg-purple-900/30 px-2 text-[11px] text-purple-300 disabled:opacity-40"
-              type="button"
-              disabled={isReanalyzing || isAnalyzing}
-              onClick={onRunReanalysis}
-              title="Re-analiza usando el modelo de apariencia calibrado (sin ByteTrack)"
-            >
-              {isReanalyzing ? "Refinando…" : "Refinar"}
-            </button>
+            <div className="flex gap-1">
+              {refinedOutputDir ? (
+                <button
+                  className="h-6 border border-purple-400 bg-purple-800/40 px-2 text-[11px] text-purple-200"
+                  type="button"
+                  onClick={onOpenRefined}
+                >
+                  Abrir refinado
+                </button>
+              ) : null}
+              <button
+                className="h-6 border border-purple-600 bg-purple-900/30 px-2 text-[11px] text-purple-300 disabled:opacity-40"
+                type="button"
+                disabled={isReanalyzing || isAnalyzing}
+                onClick={onRunReanalysis}
+                title="Re-analiza usando el modelo de apariencia calibrado (sin ByteTrack)"
+              >
+                {isReanalyzing ? "Refinando…" : "Refinar"}
+              </button>
+            </div>
           </div>
           <p className="text-[10px] leading-4 text-slate-500">
-            Usa los mejores frames del análisis existente para calibrar el modelo de apariencia,
-            luego re-corre seg+pose en todo el video sin ByteTrack.
-            Resultado en <em>output/_refined/</em>
+            {propagationEndFrame !== null && currentFrameIdx !== null && currentFrameIdx < propagationEndFrame
+              ? `Semilla: frames ${currentFrameIdx}–${propagationEndFrame} (rango Shift+Click). `
+              : "Sin rango: usa los mejores frames de todo el video. "}
+            Shift+Click en el timeline para definir el intervalo de referencia.
           </p>
           {isReanalyzing ? <AnalysisProgress job={reanalysisJob} /> : null}
         </div>

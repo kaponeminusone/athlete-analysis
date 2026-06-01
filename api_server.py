@@ -181,10 +181,10 @@ def _indexed_images(folder: Path, prefix: str) -> dict[str, str]:
     return images
 
 
-def _project_payload(video_path: str) -> dict:
+def _project_payload(video_path: str, output_dir: Optional[str] = None) -> dict:
     video_file = Path(video_path)
     video_name = _video_name(video_path)
-    out_dir = OUTPUT_ROOT / video_name
+    out_dir = Path(output_dir) if output_dir else OUTPUT_ROOT / video_name
     analysis_path = out_dir / "analysis.json"
     chart_path = out_dir / "charts" / "camera_angle_timeline.png"
     analysis_data = None
@@ -216,8 +216,8 @@ def _project_payload(video_path: str) -> dict:
 
 
 @app.get("/api/project")
-def get_project(video_path: str):
-    return JSONResponse(_project_payload(video_path))
+def get_project(video_path: str, output_dir: Optional[str] = None):
+    return JSONResponse(_project_payload(video_path, output_dir=output_dir))
 
 
 @app.get("/api/demo")
@@ -314,11 +314,13 @@ def analyze_video_api(req: AnalyzeRequest):
 
 
 class ReanalyzeRequest(BaseModel):
-    video_path: str
-    stride:     int   = 1
-    start_sec:  float = 0.0
-    end_sec:    Optional[float] = None
-    seed_frames: int  = 15
+    video_path:        str
+    stride:            int   = 1
+    start_sec:         float = 0.0
+    end_sec:           Optional[float] = None
+    seed_frames:       int   = 15
+    seed_start_frame:  Optional[int] = None   # frame_idx interval for seeding
+    seed_end_frame:    Optional[int] = None
 
 
 @app.post("/api/reanalyze")
@@ -356,6 +358,8 @@ def reanalyze_video(req: ReanalyzeRequest):
         end_sec=req.end_sec,
         seed_frames=req.seed_frames,
         annotate_every=1,
+        seed_start_frame=req.seed_start_frame,
+        seed_end_frame=req.seed_end_frame,
     )
 
     def _run():

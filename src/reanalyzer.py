@@ -64,6 +64,8 @@ class ReanalysisConfig:
     end_sec:             Optional[float] = None
     seed_frames:         int   = SEED_MAX_FRAMES
     annotate_every:      int   = 1
+    seed_start_frame:    Optional[int] = None   # restrict seed to this interval
+    seed_end_frame:      Optional[int] = None   # (both must be set to take effect)
 
 
 # ─── Seed phase ───────────────────────────────────────────────────────────────
@@ -73,10 +75,18 @@ def _seed_appearance(
     model_seg,
     max_frames: int = SEED_MAX_FRAMES,
     on_progress: ProgressCallback = noop_progress,
+    seed_start_frame: Optional[int] = None,
+    seed_end_frame:   Optional[int] = None,
 ) -> Optional[AppearanceModel]:
     """
     Build an AppearanceModel from the N highest-quality frames of the
     first-pass analysis.  Re-runs YOLO seg (no tracking) to get bboxes.
+
+    If seed_start_frame and seed_end_frame are both set, only frames
+    within [start, end] are considered for seeding — useful when the
+    user knows a specific interval where detection was clean.
+    Frames outside that interval are still used as fallback if the
+    interval yields fewer than max_frames candidates.
     """
     analysis_path = Path(original_output_dir) / "analysis.json"
     if not analysis_path.exists():
@@ -86,18 +96,49 @@ def _seed_appearance(
         data = json.load(f)
 
     frames_data = data.get("frames", [])
-    usable = [
-        fr for fr in frames_data
-        if fr.get("person_detected")
-        and fr.get("quality_score", 0) >= SEED_MIN_QUALITY
-        and fr.get("camera_angle") in ("LATERAL", "SEMI_BACK")
-    ]
-    # sort by quality descending, take top N
-    usable.sort(key=lambda x: x["quality_score"], reverse=True)
-    seed_candidates = usable[:max_frames]
+    use_interval = (seed_start_frame is not None and seed_end_frame is not None
+                    and seed_end_frame > seed_start_frame)
+
+    def _is_good(fr) -> bool:
+        return (fr.get("person_detected")
+                and fr.get("quality_score", 0) >= SEED_MIN_QUALITY
+                and fr.get("camera_angle") in ("LATERAL", "SEMI_BACK"))
+
+    def _in_interval(fr) -> bool:
+        return seed_start_frame <= fr.get("frame_idx", -1) <= seed_end_frame
+
+    if use_interval:
+        # Priority 1: good frames inside the user-defined interval
+        interval_good = sorted(
+            [fr for fr in frames_data if _is_good(fr) and _in_interval(fr)],
+            key=lambda x: x["quality_score"], reverse=True,
+        )
+        # Priority 2: any detected frame inside the interval
+        interval_any = sorted(
+            [fr for fr in frames_data if fr.get("person_detected") and _in_interval(fr)
+             and fr not in interval_good],
+            key=lambda x: x.get("quality_score", 0), reverse=True,
+        )
+        combined = (interval_good + interval_any)[:max_frames]
+        # If the interval is thin, pad with the best frames from the whole video
+        if len(combined) < max_frames:
+            rest = sorted(
+                [fr for fr in frames_data if _is_good(fr) and fr not in combined],
+                key=lambda x: x["quality_score"], reverse=True,
+            )
+            combined = (combined + rest)[:max_frames]
+        seed_candidates = combined
+        print(f"  [Reanalyzer] Seeding from interval [{seed_start_frame}–{seed_end_frame}]: "
+              f"{len(interval_good)} good + {len(interval_any)} any → {len(seed_candidates)} total")
+    else:
+        usable = sorted(
+            [fr for fr in frames_data if _is_good(fr)],
+            key=lambda x: x["quality_score"], reverse=True,
+        )
+        seed_candidates = usable[:max_frames]
 
     if not seed_candidates:
-        # fallback: any detected frame
+        # last-resort fallback
         seed_candidates = sorted(
             [fr for fr in frames_data if fr.get("person_detected")],
             key=lambda x: x.get("quality_score", 0),
@@ -318,6 +359,8 @@ def run_reanalysis(
         config.original_output_dir, model_seg,
         max_frames=config.seed_frames,
         on_progress=on_progress,
+        seed_start_frame=config.seed_start_frame,
+        seed_end_frame=config.seed_end_frame,
     )
     if appearance is None or not appearance.is_ready:
         return {"error": "No se pudo sembrar el modelo de apariencia. Ejecuta el pipeline original primero."}
