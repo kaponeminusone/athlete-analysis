@@ -147,7 +147,7 @@ def annotate_frame(
                         cv2.FONT_HERSHEY_SIMPLEX, 0.30, color, 1, cv2.LINE_AA)
 
     # ── Info panel (top-left) ─────────────────────────────────────────────────
-    panel_w, panel_h = 340, 165
+    panel_w, panel_h = 340, 185
     overlay = img.copy()
     cv2.rectangle(overlay, (0, 0), (panel_w, panel_h), (15, 15, 15), -1)
     cv2.addWeighted(overlay, 0.75, img, 0.25, 0, img)
@@ -184,7 +184,30 @@ def annotate_frame(
     mask_str  = f"  Mask: {analysis.mask_area_px:,}px" if analysis.mask_area_px > 0 else ""
     y += _text(img, ratio_str + mask_str, (8, y), (180, 180, 180), 0.45, 1)
 
-    # Row 6 — frame / timestamp
+    # Row 6 — tracking source / correction badge
+    src = getattr(analysis, "tracking_source", "bytetrack")
+    src_colors = {
+        "bytetrack": (140, 140, 140),
+        "sot_csrt":  (60,  220, 255),   # cyan
+        "sot_sam2":  (80,  255, 160),   # mint
+    }
+    src_label = {"bytetrack": "ByteTrack", "sot_csrt": "SOT:CSRT", "sot_sam2": "SOT:SAM2"}.get(src, src)
+    src_color = src_colors.get(src, (140, 140, 140))
+
+    if analysis.manually_corrected:
+        ct = analysis.correction_source or "manual"
+        badge_label = f"CORREGIDO [{ct}]  {src_label}"
+        badge_color = (60, 80, 255)   # red-ish
+        # draw a highlighted background bar for visibility
+        bh_y = y - 2
+        cv2.rectangle(img, (6, bh_y - 2), (panel_w - 6, bh_y + 16), badge_color, -1)
+        cv2.putText(img, badge_label, (10, bh_y + 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+        y += 20
+    else:
+        y += _text(img, src_label, (8, y), src_color, 0.45, 1)
+
+    # Row 7 — frame / timestamp
     _text(img, f"Frame {analysis.frame_idx:06d}  t={analysis.timestamp_s:.2f}s",
           (8, y), (140, 140, 140), 0.45, 1)
 

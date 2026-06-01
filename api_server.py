@@ -398,8 +398,16 @@ def correct_frame(req: CorrectionRequest):
     if req.sot_backend in ("csrt", "sam2"):
         try:
             sot = create_sot(req.sot_backend)
+        except (RuntimeError, FileNotFoundError) as sot_err:
+            raise HTTPException(
+                status_code=422,
+                detail=f"SOT backend '{req.sot_backend}' not available: {sot_err}",
+            )
         except Exception as sot_err:
-            print(f"  [SOT] Could not create {req.sot_backend} backend: {sot_err}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"SOT backend error: {sot_err}",
+            )
 
     # Propagate to adjacent frames
     info = get_video_info(req.video_path)

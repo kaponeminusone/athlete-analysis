@@ -51,6 +51,8 @@ class Sam2SotTracker(SotBackend):
         self._last_mask: Optional[np.ndarray] = None
         self._last_bbox: Optional[tuple]       = None
         self._frame_hw:  Optional[tuple]       = None
+        # Validate at construction time so create_sot("sam2") fails fast
+        self._ensure_loaded()
 
     # ── Lazy load ──────────────────────────────────────────────────────────────
 
