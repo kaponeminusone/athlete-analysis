@@ -1,0 +1,33 @@
+---
+description: Contexto del prototipo Triple Jump YOLO — arquitectura y entry points
+alwaysApply: true
+---
+
+# Prototipo Triple Jump — contexto del proyecto
+
+Herramienta de análisis de video para carrera + 5 hops (4 en pista + salto final a arena): YOLO11 pose + segmentación, tracking del atleta, clasificación de ángulo de cámara, calibración de pista, fases y UI de revisión con correcciones manuales. Ver ANALYSIS_PLAN.md.
+
+## Stack
+
+- **Backend/ML:** Python — Ultralytics YOLO11, OpenCV, FastAPI (`api_server.py`)
+- **Frontend:** React 19 + Vite 8 + Tailwind 4 en `ui/`
+- **Pipeline:** `src/pipeline.py` (compartido por CLI y API)
+
+## Entry points
+
+| Comando | Uso |
+|---------|-----|
+| `python run.py <video.mp4>` | Pipeline CLI |
+| `python api_server.py` | API completa → `:8000` |
+| `npm run dev` | UI React → `:5173` (proxy a API) |
+
+## Estructura clave
+
+- `src/` — pipeline, pose, tracker, correcciones, reanálisis
+- `ui/src/App.jsx` — UI monolítica (~1600 líneas)
+- `output/<video>/` — frames, annotated, charts, `analysis.json`
+
+## Notas
+
+- Docs en español. PyTorch/CUDA se instala manualmente; pesos YOLO se descargan al primer uso.
+- `api_server.py` es el servidor recomendado (correcciones, jobs); `ui_server.py` es básico.
