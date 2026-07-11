@@ -29,9 +29,8 @@ What this module does differently:
 from __future__ import annotations
 
 import json
-import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -39,10 +38,11 @@ import cv2
 import numpy as np
 
 from .athlete_tracker import _padded_crop, MIN_BBOX_AREA
+from .calibration import load_calibration
 from .frame_extractor import get_video_info
 from .job_store import ProgressCallback, noop_progress
+from .mask_utils import athlete_mask_overlap, load_mask_png
 from .pose_analyzer import (
-    CameraAngle,
     FrameAnalysis,
     analyze_frame_from_tracker,
 )
@@ -55,7 +55,87 @@ from .schemas import (
 
 SEED_MIN_QUALITY = 0.65
 SEED_MAX_FRAMES  = 15
-MIN_SIMILARITY   = 0.25     # minimum to accept a match
+MIN_SIMILARITY   = 0.25     # minimum to accept a match (appearance-only)
+MIN_SIMILARITY_WITH_MASKS = 0.20  # slightly lower floor when venue masks bias selection
+TRACK_OV_WEIGHT  = 0.30
+SAND_OV_WEIGHT   = 0.20
+MASK_CAL_MODES   = ("color_masks", "cnn_masks", "keyframe_masks")
+
+
+@dataclass
+class VenueMaskBias:
+    """Load track/sand PNGs from original calibration for refine scoring."""
+
+    output_dir: Path
+    mask_frames: dict
+    mode: str = ""
+    _cache: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_output_dir(cls, output_dir: str | Path) -> Optional["VenueMaskBias"]:
+        out = Path(output_dir)
+        cal = load_calibration(out)
+        if cal is None:
+            print(f"  [Reanalyzer] use_cnn_masks: no calibration.json in {out}")
+            return None
+        mode = cal.get("mode") or ""
+        mask_frames = cal.get("mask_frames") or {}
+        if mode not in MASK_CAL_MODES or not mask_frames:
+            print(
+                f"  [Reanalyzer] use_cnn_masks: no usable mask_frames "
+                f"(mode={mode!r}, frames={len(mask_frames)})"
+            )
+            return None
+        print(
+            f"  [Reanalyzer] Venue masks ON ({mode}): "
+            f"{len(mask_frames)} mask_frames from {out}"
+        )
+        return cls(output_dir=out, mask_frames=mask_frames, mode=mode)
+
+    def _nearest_mask_entry(self, frame_idx: int) -> Optional[dict]:
+        if not self.mask_frames:
+            return None
+        key = str(frame_idx)
+        if key in self.mask_frames:
+            return self.mask_frames[key]
+        keys = sorted(int(k) for k in self.mask_frames)
+        nearest = min(keys, key=lambda k: abs(k - frame_idx))
+        return self.mask_frames[str(nearest)]
+
+    def load_masks(
+        self, frame_idx: int,
+    ) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        if frame_idx in self._cache:
+            return self._cache[frame_idx]
+        track_mask = sand_mask = None
+        entry = self._nearest_mask_entry(frame_idx)
+        if entry:
+            track_rel = entry.get("track")
+            sand_rel = entry.get("sand")
+            if track_rel:
+                track_mask = load_mask_png(self.output_dir / track_rel)
+            if sand_rel:
+                sand_mask = load_mask_png(self.output_dir / sand_rel)
+        self._cache[frame_idx] = (track_mask, sand_mask)
+        return track_mask, sand_mask
+
+    def overlaps(
+        self,
+        frame_idx: int,
+        bbox: tuple[float, float, float, float],
+        seg_mask: Optional[np.ndarray],
+        width: int,
+        height: int,
+    ) -> tuple[float, float]:
+        track_mask, sand_mask = self.load_masks(frame_idx)
+        track_ov = athlete_mask_overlap(bbox, seg_mask, track_mask, width, height)
+        sand_ov = athlete_mask_overlap(bbox, seg_mask, sand_mask, width, height)
+        return float(track_ov), float(sand_ov)
+
+
+def _blend_mask_score(appearance_sim: float, track_ov: float, sand_ov: float) -> float:
+    """Combine appearance with venue overlap. score = sim + 0.30*track + 0.20*sand."""
+    return float(appearance_sim + TRACK_OV_WEIGHT * track_ov + SAND_OV_WEIGHT * sand_ov)
 
 
 # ─── Robust appearance model ──────────────────────────────────────────────────
@@ -224,6 +304,7 @@ class ReanalysisConfig:
     annotate_every:      int   = 1
     seed_start_frame:    Optional[int] = None   # restrict seed to this interval
     seed_end_frame:      Optional[int] = None   # (both must be set to take effect)
+    use_cnn_masks:       bool  = False          # bias selection with venue mask_frames
 
 
 # ─── Seed phase ───────────────────────────────────────────────────────────────
@@ -235,6 +316,7 @@ def _seed_appearance(
     on_progress: ProgressCallback = noop_progress,
     seed_start_frame: Optional[int] = None,
     seed_end_frame:   Optional[int] = None,
+    mask_bias: Optional[VenueMaskBias] = None,
 ) -> Optional[RobustAppearanceModel]:
     """
     Build an AppearanceModel from the N highest-quality frames of the
@@ -333,15 +415,25 @@ def _seed_appearance(
         if not valid:
             continue
 
+        h, w = img.shape[:2]
+
         def _get_mask(idx):
             if res.masks is not None and idx < len(res.masks.data):
                 mt = res.masks.data[idx].cpu().numpy()
-                return cv2.resize(mt, (img.shape[1], img.shape[0]),
+                return cv2.resize(mt, (w, h),
                                   interpolation=cv2.INTER_NEAREST).astype(bool)
             return None
 
-        # Largest detection = positive (most prominent person in a seed frame)
-        best = max(valid, key=lambda i: areas[i])
+        # Prefer largest detection; with masks, boost by track/sand overlap
+        def _seed_rank(i):
+            area = areas[i]
+            if mask_bias is None:
+                return area
+            bbox = tuple(float(v) for v in bboxes[i])
+            track_ov, sand_ov = mask_bias.overlaps(fidx, bbox, _get_mask(i), w, h)
+            return area * (1.0 + TRACK_OV_WEIGHT * track_ov + SAND_OV_WEIGHT * sand_ov)
+
+        best = max(valid, key=_seed_rank)
         bbox = tuple(int(v) for v in bboxes[best])
         model.add_positive(img, _get_mask(best), bbox)
         seeded += 1
@@ -374,10 +466,15 @@ def _analyze_frame_refined(
     model_seg,
     model_pose,
     appearance: RobustAppearanceModel,
+    mask_bias: Optional[VenueMaskBias] = None,
 ) -> FrameAnalysis:
     """
-    Run seg (no tracking) → pick best appearance match → pose on crop.
+    Run seg (no tracking) → pick best appearance (+ optional venue mask) match → pose.
     Returns a FrameAnalysis with tracking_source = "refined".
+
+    When mask_bias is set:
+      score = appearance_sim + 0.30 * track_ov + 0.20 * sand_ov
+      still require appearance_sim >= MIN_SIMILARITY_WITH_MASKS (0.20)
     """
     empty = FrameAnalysis(frame_idx=frame_idx, timestamp_s=timestamp_s)
     empty.tracking_source = "refined"
@@ -405,18 +502,29 @@ def _analyze_frame_refined(
         else:
             det_masks.append(None)
 
-    # Score each detection by appearance similarity
+    min_sim = MIN_SIMILARITY_WITH_MASKS if mask_bias is not None else MIN_SIMILARITY
+
+    # Score each detection by appearance (+ optional venue overlap)
     scores = []
     for i in valid:
         bbox  = tuple(int(v) for v in bboxes[i])
         sim   = appearance.similarity(image, mask=det_masks[i], bbox=bbox)
-        scores.append((i, sim))
+        track_ov = sand_ov = 0.0
+        if mask_bias is not None:
+            track_ov, sand_ov = mask_bias.overlaps(
+                frame_idx, bbox, det_masks[i], w, h,
+            )
+            combined = _blend_mask_score(sim, track_ov, sand_ov)
+        else:
+            combined = sim
+        scores.append((i, sim, combined, track_ov, sand_ov))
 
-    # Pick highest similarity
-    best_i, best_sim = max(scores, key=lambda x: x[1])
-
-    if best_sim < MIN_SIMILARITY:
+    # Pick highest combined score among candidates that clear appearance floor
+    eligible = [s for s in scores if s[1] >= min_sim]
+    if not eligible:
         return empty
+
+    best_i, best_sim, _, _, _ = max(eligible, key=lambda x: x[2])
 
     x1, y1, x2, y2 = (int(v) for v in bboxes[best_i])
     seg_mask  = det_masks[best_i]
@@ -469,7 +577,7 @@ def _analyze_frame_refined(
     det_conf = float(confs[best_i])
     if det_conf >= 0.65 and mask_area > 8000 and best_sim >= 0.50:
         appearance.add_positive(image, seg_mask, (x1, y1, x2, y2))
-    for j, _ in scores:
+    for j, sim_j, _, _, _ in scores:
         if j != best_i and best_sim > 0.50:
             bj = tuple(int(v) for v in bboxes[j])
             appearance.add_negative(image, det_masks[j], bj)
@@ -521,6 +629,15 @@ def run_reanalysis(
     model_seg  = YOLO("yolo11s-seg.pt")
     on_progress({"stage": "loading_models", "message": f"Modelos listos ({time.time()-t0:.1f}s)", "percent": 8.0})
 
+    # ── Optional venue masks from original calibration (not _refined) ─────────
+    mask_bias: Optional[VenueMaskBias] = None
+    if config.use_cnn_masks:
+        mask_bias = VenueMaskBias.from_output_dir(config.original_output_dir)
+        if mask_bias is None:
+            print("  [Reanalyzer] use_cnn_masks requested but masks unavailable — appearance-only")
+    else:
+        print("  [Reanalyzer] Venue masks OFF (appearance-only refine)")
+
     # ── Seed AppearanceModel from first-pass best frames ──────────────────────
     on_progress({"stage": "seeding", "message": "Sembrando modelo de apariencia...", "percent": 10.0})
     appearance = _seed_appearance(
@@ -529,6 +646,7 @@ def run_reanalysis(
         on_progress=on_progress,
         seed_start_frame=config.seed_start_frame,
         seed_end_frame=config.seed_end_frame,
+        mask_bias=mask_bias,
     )
     if appearance is None or not appearance.is_ready:
         return {"error": "No se pudo sembrar el modelo de apariencia. Ejecuta el pipeline original primero."}
@@ -574,6 +692,7 @@ def run_reanalysis(
                 model_seg=model_seg,
                 model_pose=model_pose,
                 appearance=appearance,
+                mask_bias=mask_bias,
             )
             analyses.append(fa)
             analysis_count += 1
@@ -621,9 +740,10 @@ def run_reanalysis(
         video_path=config.video_path,
         video_info=info,
         config={
-            "stride":    config.stride,
-            "start_sec": config.start_sec,
-            "end_sec":   config.end_sec,
+            "stride":         config.stride,
+            "start_sec":      config.start_sec,
+            "end_sec":        config.end_sec,
+            "use_cnn_masks":  bool(mask_bias is not None),
         },
         summary=summary,
         frames=frames_data,

@@ -191,7 +191,7 @@ class TrackScorerContext:
         cal = load_calibration(output_dir)
         if cal is None:
             return None
-        mask_mode = cal.get("mode") == "color_masks"
+        mask_mode = cal.get("mode") in ("color_masks", "cnn_masks", "keyframe_masks")
         kfs = sorted(cal.get("keyframes") or [], key=lambda k: k["frame_idx"])
         if not kfs and not mask_mode:
             return None

@@ -384,6 +384,7 @@ function App() {
   const [isReanalyzing, setIsReanalyzing] = useState(false);
   const [reanalysisJob, setReanalysisJob] = useState(null);
   const [refinedOutputDir, setRefinedOutputDir] = useState(null);
+  const [useCnnMasks, setUseCnnMasks] = useState(false);
   const [detections, setDetections] = useState([]);
   const [correctionVersion, setCorrectionVersion] = useState(0);
   const [workMode, setWorkMode] = useState("athlete");
@@ -585,6 +586,11 @@ function App() {
     loadCalibration(project.video.video_name);
   }, [project?.video?.video_name]);
 
+  const canUseCnnMasks = hasMaskCalibration(calibration);
+  useEffect(() => {
+    setUseCnnMasks(canUseCnnMasks);
+  }, [canUseCnnMasks, project?.video?.video_name]);
+
   useEffect(() => {
     setCalDraftPoints([]);
     if (workMode !== "track" || !showAdvancedTrack || calibrationSubMode !== "seed" || !currentFrame) {
@@ -756,6 +762,7 @@ function App() {
           ...body,
           seed_start_frame: seedStart,
           seed_end_frame: seedEnd,
+          use_cnn_masks: Boolean(useCnnMasks && canUseCnnMasks),
         }),
       });
       pollReanalysisJob(result.job_id, path, result.output_dir);
@@ -1572,6 +1579,9 @@ function App() {
                 reanalysisJob={reanalysisJob}
                 refinedOutputDir={refinedOutputDir}
                 onOpenRefined={openRefinedProject}
+                useCnnMasks={useCnnMasks}
+                setUseCnnMasks={setUseCnnMasks}
+                canUseCnnMasks={canUseCnnMasks}
                 workMode={workMode}
                 onSwitchWorkMode={switchWorkMode}
                 correctionMode={correctionMode}
@@ -3114,6 +3124,9 @@ function Inspector({
   reanalysisJob,
   refinedOutputDir,
   onOpenRefined,
+  useCnnMasks,
+  setUseCnnMasks,
+  canUseCnnMasks,
   workMode,
   onSwitchWorkMode,
   correctionMode,
@@ -3888,6 +3901,32 @@ function Inspector({
               : "Sin rango: usa los mejores frames de todo el video. "}
             Shift+Click en el timeline para definir el intervalo de referencia.
           </p>
+          <label
+            className={`mt-1.5 flex items-start gap-1.5 text-[10px] leading-4 ${
+              canUseCnnMasks ? "text-slate-300 cursor-pointer" : "text-slate-600 cursor-not-allowed"
+            }`}
+            title={
+              canUseCnnMasks
+                ? "Prefiere atletas sobre pista/arena usando máscaras de calibración"
+                : "Aplica un perfil de venue (CNN / keyframes / color) con mask_frames primero"
+            }
+          >
+            <input
+              type="checkbox"
+              className="mt-0.5"
+              checked={Boolean(useCnnMasks && canUseCnnMasks)}
+              disabled={!canUseCnnMasks || isReanalyzing || isAnalyzing}
+              onChange={(e) => setUseCnnMasks(e.target.checked)}
+            />
+            <span>
+              Usar máscaras CNN (pista/arena)
+              {!canUseCnnMasks ? (
+                <span className="block text-slate-600">
+                  Sin mask_frames en calibración — aplica venue primero.
+                </span>
+              ) : null}
+            </span>
+          </label>
           {isReanalyzing ? <AnalysisProgress job={reanalysisJob} /> : null}
         </div>
       ) : null}

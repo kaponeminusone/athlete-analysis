@@ -1295,6 +1295,7 @@ class ReanalyzeRequest(BaseModel):
     seed_frames:       int   = 15
     seed_start_frame:  Optional[int] = None   # frame_idx interval for seeding
     seed_end_frame:    Optional[int] = None
+    use_cnn_masks:     bool  = False
 
 
 @app.post("/api/reanalyze")
@@ -1334,6 +1335,7 @@ def reanalyze_video(req: ReanalyzeRequest):
         annotate_every=1,
         seed_start_frame=req.seed_start_frame,
         seed_end_frame=req.seed_end_frame,
+        use_cnn_masks=req.use_cnn_masks,
     )
 
     def _run():
