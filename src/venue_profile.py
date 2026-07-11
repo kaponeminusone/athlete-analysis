@@ -685,6 +685,8 @@ def learn_from_selections(
             existing.get("lane_angle_deg") if existing else None
         ),
     }
+    if existing and existing.get("hops_corridor_m") is not None:
+        profile["hops_corridor_m"] = existing["hops_corridor_m"]
     if sand_stats:
         profile["sand_color"] = _write_color_block(sand_stats)
         profile["sand_hsv"] = sand_stats

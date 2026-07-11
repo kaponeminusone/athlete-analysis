@@ -16,6 +16,7 @@ import {
   SquareDashedMousePointer,
   RefreshCw,
   Map,
+  ChartColumn,
 } from "lucide-react";
 
 const angleColors = {
@@ -52,7 +53,143 @@ const phaseLabels = {
   hop_4: "HOP 4",
   final_jump: "SALTO FINAL",
   landing: "ATERRIZAJE",
+  final: "FINAL",
 };
+
+const segmentLabels = {
+  approach: "Carrera",
+  hop_1: "H1",
+  hop_2: "H2",
+  hop_3: "H3",
+  hop_4: "H4 / final",
+  final: "Final",
+};
+
+const compareSegmentLabels = {
+  hop_1: "H1",
+  hop_2: "H2",
+  hop_3: "H3",
+  hop_4: "H4→aterrizaje",
+  final: "H4→aterrizaje",
+};
+
+const poseHopLabels = {
+  hop_1: "H1",
+  hop_2: "H2",
+  hop_3: "H3",
+  hop_4: "H4",
+};
+
+const poseLabelText = {
+  buena: "Buena",
+  regular: "Regular",
+  débil: "Débil",
+  debil: "Débil",
+};
+
+function poseOverlayUrl(videoName, phase, outputDir, cacheKey) {
+  if (!videoName || !phase) return "";
+  const params = {};
+  if (outputDir) params.output_dir = outputDir;
+  if (cacheKey != null && cacheKey !== "") params.v = String(cacheKey);
+  return apiUrl(`/api/metrics/${encodeURIComponent(videoName)}/pose-overlay/${encodeURIComponent(phase)}`, params).toString();
+}
+
+function PoseOverlayThumb({ videoName, phase, outputDir, cacheKey, title }) {
+  const [status, setStatus] = useState("loading"); // loading | ok | error
+  const [enlarged, setEnlarged] = useState(false);
+  const src = poseOverlayUrl(videoName, phase, outputDir, cacheKey);
+
+  useEffect(() => {
+    setStatus("loading");
+  }, [src]);
+
+  if (!videoName || !src) {
+    return (
+      <div className="mt-1 flex h-16 items-center justify-center border border-dashed border-editor-700 bg-editor-850 text-[9px] text-slate-500">
+        Sin video
+      </div>
+    );
+  }
+
+  return (
+    <>
+      <button
+        type="button"
+        className="mt-1 block w-full overflow-hidden border border-editor-700 bg-editor-850 text-left"
+        onClick={() => status === "ok" && setEnlarged(true)}
+        title={title || "Ampliar superposición"}
+      >
+        {status === "loading" ? (
+          <div className="flex h-16 items-center justify-center text-[9px] text-slate-500">
+            Cargando overlay…
+          </div>
+        ) : null}
+        {status === "error" ? (
+          <div className="flex h-16 items-center justify-center text-[9px] text-slate-500">
+            Overlay no disponible
+          </div>
+        ) : null}
+        <img
+          src={src}
+          alt={title || `Overlay ${phase}`}
+          className={`max-h-28 w-full object-contain ${status === "ok" ? "block" : "hidden"}`}
+          onLoad={() => setStatus("ok")}
+          onError={() => setStatus("error")}
+        />
+      </button>
+      {enlarged ? (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
+          onClick={() => setEnlarged(false)}
+          onKeyDown={(e) => e.key === "Escape" && setEnlarged(false)}
+          role="dialog"
+          aria-modal="true"
+        >
+          <img
+            src={src}
+            alt={title || `Overlay ${phase}`}
+            className="max-h-[85vh] max-w-[90vw] border border-editor-600 bg-editor-900 object-contain shadow-lg"
+            onClick={(e) => e.stopPropagation()}
+          />
+        </div>
+      ) : null}
+    </>
+  );
+}
+
+function formatSignedDelta(value, digits = 2, unit = "") {
+  if (value == null || !Number.isFinite(Number(value))) return "—";
+  const n = Number(value);
+  const sign = n > 0 ? "+" : "";
+  return `${sign}${n.toFixed(digits)}${unit}`;
+}
+
+function indicatorGlyph(ind) {
+  if (ind === "+") return "+";
+  if (ind === "-" || ind === "−") return "−";
+  if (ind === "~" || ind === "≈") return "≈";
+  return "·";
+}
+
+function indicatorClass(ind) {
+  if (ind === "+") return "text-emerald-300";
+  if (ind === "-" || ind === "−") return "text-amber-300";
+  if (ind === "~" || ind === "≈") return "text-slate-400";
+  return "text-slate-500";
+}
+
+function poseBarClass(label) {
+  if (label === "buena") return "bg-emerald-500";
+  if (label === "regular") return "bg-amber-400";
+  return "bg-rose-400";
+}
+
+function poseBadgeClass(label) {
+  if (label === "buena") return "border-emerald-600/60 text-emerald-200";
+  if (label === "regular") return "border-amber-600/60 text-amber-200";
+  return "border-rose-600/60 text-rose-200";
+}
 
 const phaseMarkerShort = {
   approach: "CR",
@@ -385,6 +522,7 @@ function App() {
   const [reanalysisJob, setReanalysisJob] = useState(null);
   const [refinedOutputDir, setRefinedOutputDir] = useState(null);
   const [useCnnMasks, setUseCnnMasks] = useState(false);
+  const [refineV2, setRefineV2] = useState(false);
   const [detections, setDetections] = useState([]);
   const [correctionVersion, setCorrectionVersion] = useState(0);
   const [workMode, setWorkMode] = useState("athlete");
@@ -415,6 +553,10 @@ function App() {
   const [phaseMarkTag, setPhaseMarkTag] = useState("");
   const [phasePlaceMode, setPhasePlaceMode] = useState(false);
   const [athleteId, setAthleteId] = useState("");
+  const [isComputingMetrics, setIsComputingMetrics] = useState(false);
+  const [isApplyingOverrides, setIsApplyingOverrides] = useState(false);
+  const [corridorMetersInput, setCorridorMetersInput] = useState("10");
+  const metricsAutoComputeRef = useRef("");
   const [venueProfile, setVenueProfile] = useState(null);
   const [venueModel, setVenueModel] = useState(null);
   const [venueDataset, setVenueDataset] = useState(null);
@@ -428,6 +570,7 @@ function App() {
 
   const frames = project?.analysis?.frames || [];
   const sections = project?.sections?.data || null;
+  const metrics = project?.metrics?.data || null;
   const currentFrame = frames[frameIndex] || null;
   const summary = project?.analysis?.data?.summary || {};
   const analysisExists = Boolean(project?.analysis?.exists);
@@ -454,6 +597,34 @@ function App() {
       setAthleteId(sections.athlete_id);
     }
   }, [sections?.athlete_id, project?.video?.video_name]);
+
+  useEffect(() => {
+    const corridor =
+      metrics?.overrides?.hops_corridor_m
+      ?? metrics?.scale?.hops_corridor_m
+      ?? venueProfile?.profile?.hops_corridor_m
+      ?? venueProfile?.hops_corridor_m
+      ?? 10;
+    setCorridorMetersInput(String(corridor));
+  }, [project?.video?.video_name, metrics?.derived_version, metrics?.scale?.hops_corridor_m, venueProfile?.profile?.hops_corridor_m, venueProfile?.hops_corridor_m]);
+
+  // Auto-compute metrics once when entering Análisis with contacts but no segments yet
+  useEffect(() => {
+    if (workMode !== "analisis") return;
+    const videoName = project?.video?.video_name;
+    if (!videoName || !analysisExists) return;
+    const contactCount = sections?.contacts?.length ?? 0;
+    if (contactCount < 5) return;
+    const hasSegments = Boolean(metrics?.segments?.length);
+    const key = `${videoName}:${metrics?.derived_version ?? "none"}:${contactCount}`;
+    if (hasSegments) {
+      metricsAutoComputeRef.current = key;
+      return;
+    }
+    if (metricsAutoComputeRef.current === key || isComputingMetrics) return;
+    metricsAutoComputeRef.current = key;
+    recomputeMetrics();
+  }, [workMode, project?.video?.video_name, analysisExists, sections?.contacts?.length, metrics?.segments?.length, metrics?.derived_version]);
 
   useEffect(() => {
     const cfg = project?.analysis?.data?.config;
@@ -763,6 +934,7 @@ function App() {
           seed_start_frame: seedStart,
           seed_end_frame: seedEnd,
           use_cnn_masks: Boolean(useCnnMasks && canUseCnnMasks),
+          refine_v2: Boolean(refineV2),
         }),
       });
       pollReanalysisJob(result.job_id, path, result.output_dir);
@@ -1018,6 +1190,58 @@ function App() {
       setNoticeStrong(true);
     } finally {
       setIsPropagatingPhases(false);
+    }
+  }
+
+  async function recomputeMetrics() {
+    const videoName = project?.video?.video_name;
+    if (!videoName) return;
+    setIsComputingMetrics(true);
+    setNotice("Recalculando métricas...");
+    setNoticeStrong(false);
+    try {
+      const qs = athleteId ? `?athlete_id=${encodeURIComponent(athleteId)}` : "";
+      await fetchJson(`/api/metrics/${encodeURIComponent(videoName)}/compute${qs}`, {
+        method: "POST",
+      });
+      await reloadProject();
+      setNotice("Métricas actualizadas.");
+    } catch (error) {
+      setNotice(`Error al recalcular métricas: ${error.message}`);
+      setNoticeStrong(true);
+    } finally {
+      setIsComputingMetrics(false);
+    }
+  }
+
+  async function applyCorridorScale() {
+    const videoName = project?.video?.video_name;
+    if (!videoName) return;
+    const n = Number(String(corridorMetersInput).trim());
+    if (!Number.isFinite(n) || n <= 0) {
+      setNotice("Indica una longitud de pista de hops válida (metros).");
+      setNoticeStrong(true);
+      return;
+    }
+    setIsApplyingOverrides(true);
+    setNotice("Actualizando escala del corredor...");
+    setNoticeStrong(false);
+    try {
+      const body = { hops_corridor_m: n };
+      if (athleteId) body.athlete_id = athleteId;
+      await fetchJson(`/api/metrics/${encodeURIComponent(videoName)}/scale`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      await loadVenueProfile();
+      await reloadProject();
+      setNotice(`Escala actualizada: ${n} m (1er hop → aterrizaje).`);
+    } catch (error) {
+      setNotice(`Error al actualizar escala: ${error.message}`);
+      setNoticeStrong(true);
+    } finally {
+      setIsApplyingOverrides(false);
     }
   }
 
@@ -1582,6 +1806,8 @@ function App() {
                 useCnnMasks={useCnnMasks}
                 setUseCnnMasks={setUseCnnMasks}
                 canUseCnnMasks={canUseCnnMasks}
+                refineV2={refineV2}
+                setRefineV2={setRefineV2}
                 workMode={workMode}
                 onSwitchWorkMode={switchWorkMode}
                 correctionMode={correctionMode}
@@ -1681,6 +1907,15 @@ function App() {
                 setPhasePlaceMode={setPhasePlaceMode}
                 onSelectFrame={selectFrame}
                 frames={frames}
+                metrics={metrics}
+                videoName={project?.video?.video_name || null}
+                outputDir={project?.output?.path || null}
+                onRecomputeMetrics={recomputeMetrics}
+                isComputingMetrics={isComputingMetrics}
+                corridorMetersInput={corridorMetersInput}
+                setCorridorMetersInput={setCorridorMetersInput}
+                onApplyCorridorScale={applyCorridorScale}
+                isApplyingOverrides={isApplyingOverrides}
               />
             </Panel>
           </PanelGroup>
@@ -3127,6 +3362,8 @@ function Inspector({
   useCnnMasks,
   setUseCnnMasks,
   canUseCnnMasks,
+  refineV2,
+  setRefineV2,
   workMode,
   onSwitchWorkMode,
   correctionMode,
@@ -3219,6 +3456,15 @@ function Inspector({
   setPhasePlaceMode,
   onSelectFrame,
   frames = [],
+  metrics = null,
+  videoName = null,
+  outputDir = null,
+  onRecomputeMetrics,
+  isComputingMetrics = false,
+  corridorMetersInput = "10",
+  setCorridorMetersInput,
+  onApplyCorridorScale,
+  isApplyingOverrides = false,
 }) {
   const currentPhase = currentFrame
     ? (currentFrame.phase || phaseForFrame(sections, currentFrame.frame_idx))
@@ -3261,9 +3507,10 @@ function Inspector({
   return (
     <aside className="h-full overflow-auto bg-editor-800">
       <PanelTitle>Modo de trabajo</PanelTitle>
-      <div className="grid grid-cols-2 gap-1.5 px-2 pb-2">
-        <WorkModeButton active={workMode === "athlete"} label="Revisar atleta" onClick={() => onSwitchWorkMode("athlete")} />
+      <div className="grid grid-cols-3 gap-1.5 px-2 pb-2">
+        <WorkModeButton active={workMode === "athlete"} label="Atleta" onClick={() => onSwitchWorkMode("athlete")} />
         <WorkModeButton active={workMode === "track"} label="Pista" icon={<Map className="h-3 w-3" />} onClick={() => onSwitchWorkMode("track")} />
+        <WorkModeButton active={workMode === "analisis"} label="Análisis" icon={<ChartColumn className="h-3 w-3" />} onClick={() => onSwitchWorkMode("analisis")} />
       </div>
 
       {workMode === "athlete" ? (
@@ -3294,7 +3541,9 @@ function Inspector({
         ) : null}
       </div>
         </>
-      ) : (
+      ) : null}
+
+      {workMode === "track" ? (
         <>
       <PanelTitle>Pista — frame actual</PanelTitle>
       {hasMaskCalibration(calibration) ? (
@@ -3333,7 +3582,292 @@ function Inspector({
         ) : null}
       </div>
         </>
-      )}
+      ) : null}
+
+      {workMode === "analisis" ? (
+        <div className="mt-2 px-2 pb-3">
+          <div className="mb-2 text-[11px] font-bold uppercase text-slate-300">Análisis — métricas</div>
+          {!analysisExists ? (
+            <div className="mb-2 border border-amber-500/50 bg-amber-500/10 px-2 py-2 text-[11px] leading-4 text-amber-100">
+              Analiza el video primero
+            </div>
+          ) : contactCount < 5 ? (
+            <div className="mb-2 border border-amber-500/50 bg-amber-500/10 px-2 py-2 text-[11px] leading-4 text-amber-100">
+              Detecta o marca los 5 hops en Fases ({contactCount}/5). Sin 5 contactos no hay estadísticas completas.
+            </div>
+          ) : null}
+          {analysisExists && contactCount >= 5 && !athleteId ? (
+            <div className="mb-2 border border-slate-600/60 bg-editor-850 px-2 py-1.5 text-[10px] leading-4 text-slate-400">
+              Opcional: define ID atleta en Fases para comparar consistencia vs historial.
+            </div>
+          ) : null}
+
+          {analysisExists && contactCount >= 5 ? (
+            <>
+              <label className="mb-2 block text-[10px] text-slate-400">
+                Longitud pista de hops (m)
+                <input
+                  className="mt-0.5 h-7 w-full border border-editor-600 bg-editor-900 px-2 text-[11px] text-slate-200"
+                  type="number"
+                  step="0.1"
+                  min="0.1"
+                  value={corridorMetersInput}
+                  onChange={(e) => setCorridorMetersInput(e.target.value)}
+                  onBlur={() => {
+                    const n = Number(String(corridorMetersInput).trim());
+                    const current = metrics?.scale?.hops_corridor_m ?? metrics?.overrides?.hops_corridor_m;
+                    if (Number.isFinite(n) && n > 0 && current != null && Math.abs(n - Number(current)) > 1e-6) {
+                      onApplyCorridorScale?.();
+                    }
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") onApplyCorridorScale?.();
+                  }}
+                />
+              </label>
+              <p className="mb-2 text-[10px] leading-4 text-slate-500">
+                Escala: {metrics?.scale?.hops_corridor_m ?? corridorMetersInput} m de 1er hop → aterrizaje (por defecto 10 m)
+              </p>
+              {metrics?.segments?.length ? (
+                <div className="mb-2 overflow-x-auto border border-editor-700 bg-editor-900">
+                  <table className="w-full text-left text-[10px] text-slate-300">
+                    <thead className="bg-editor-850 text-slate-400">
+                      <tr>
+                        <th className="px-1.5 py-1 font-medium">Segmento</th>
+                        <th className="px-1.5 py-1 font-medium">t (s)</th>
+                        <th className="px-1.5 py-1 font-medium">dist (m)</th>
+                        <th className="px-1.5 py-1 font-medium">vel (m/s)</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {metrics.segments.map((seg) => {
+                        const dist = seg.length_m != null
+                          ? seg.length_m.toFixed(2)
+                          : "—";
+                        const vel = seg.speed_m_s != null
+                          ? seg.speed_m_s.toFixed(2)
+                          : "—";
+                        return (
+                          <tr key={`${seg.id}-${seg.from_frame}-${seg.to_frame}`} className="border-t border-editor-800">
+                            <td className="px-1.5 py-1">{segmentLabels[seg.id] || seg.label || seg.id}</td>
+                            <td className="px-1.5 py-1">{seg.dt_s != null ? seg.dt_s.toFixed(3) : "—"}</td>
+                            <td className="px-1.5 py-1">{dist}</td>
+                            <td className="px-1.5 py-1">{vel}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <div className="mb-2 text-[10px] text-slate-500">
+                  {isComputingMetrics ? "Calculando métricas..." : "Sin segmentos aún. Pulsa recalcular si hace falta."}
+                </div>
+              )}
+              <div className="mb-2 grid gap-0.5 border border-editor-700 bg-editor-850 px-2 py-1.5 text-[10px] text-slate-300">
+                <div>
+                  Total corredor hops:{" "}
+                  {metrics?.total_hops_m != null
+                    ? `${metrics.total_hops_m.toFixed(2)} m`
+                    : "—"}
+                </div>
+                {metrics?.consistency?.overall != null ? (
+                  <div className="text-slate-400">
+                    vs Atleta / historial: {Math.round(metrics.consistency.overall * 100)}%
+                    {metrics.consistency.sessions_compared
+                      ? ` (${metrics.consistency.sessions_compared} sesión${metrics.consistency.sessions_compared === 1 ? "" : "es"})`
+                      : ""}
+                  </div>
+                ) : athleteId ? (
+                  <div className="text-slate-500">vs Atleta: sin historial/plantilla aún</div>
+                ) : null}
+              </div>
+
+              {/* vs General */}
+              <div className="mb-2 border border-editor-700 bg-editor-900">
+                <div className="flex items-center justify-between border-b border-editor-800 bg-editor-850 px-2 py-1">
+                  <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-300">
+                    vs General
+                  </span>
+                  {metrics?.comparison?.vs_general?.overall != null ? (
+                    <span className="text-[10px] text-slate-400">
+                      Técnica {Math.round(metrics.comparison.vs_general.overall * 100)}%
+                    </span>
+                  ) : null}
+                </div>
+                {metrics?.comparison?.vs_general?.limited ||
+                (metrics?.comparison?.vs_general?.notes || []).includes("Baseline general limitado") ? (
+                  <div className="border-b border-editor-800 px-2 py-1 text-[10px] text-amber-200/90">
+                    Baseline general limitado
+                  </div>
+                ) : null}
+                {metrics?.comparison?.vs_general?.segments?.length ? (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left text-[10px] text-slate-300">
+                      <thead className="text-slate-500">
+                        <tr>
+                          <th className="px-1.5 py-1 font-medium">Seg</th>
+                          <th className="px-1.5 py-1 font-medium">Δt</th>
+                          <th className="px-1.5 py-1 font-medium">Δv</th>
+                          <th className="px-1.5 py-1 font-medium">Δd</th>
+                          <th className="px-1.5 py-1 font-medium text-center">vs</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {metrics.comparison.vs_general.segments.map((row) => (
+                          <tr key={`vg-${row.id}`} className="border-t border-editor-800">
+                            <td className="px-1.5 py-1">
+                              {compareSegmentLabels[row.id] || row.id}
+                            </td>
+                            <td className="px-1.5 py-1 tabular-nums">
+                              {formatSignedDelta(row.dt_delta_s, 3, " s")}
+                            </td>
+                            <td className="px-1.5 py-1 tabular-nums">
+                              {formatSignedDelta(row.speed_delta_ms, 2, " m/s")}
+                            </td>
+                            <td className="px-1.5 py-1 tabular-nums">
+                              {formatSignedDelta(row.length_delta_m, 2, " m")}
+                            </td>
+                            <td className={`px-1.5 py-1 text-center font-semibold ${indicatorClass(row.indicator)}`}>
+                              {indicatorGlyph(row.indicator)}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                ) : (
+                  <div className="px-2 py-1.5 text-[10px] text-slate-500">
+                    Sin comparación general aún. Recalcula métricas.
+                  </div>
+                )}
+              </div>
+
+              {/* Calidad de pose */}
+              <div className="mb-2 border border-editor-700 bg-editor-900">
+                <div className="flex items-center justify-between border-b border-editor-800 bg-editor-850 px-2 py-1">
+                  <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-300">
+                    Calidad de pose
+                  </span>
+                  {metrics?.comparison?.pose_quality?.overall != null ? (
+                    <span className="text-[10px] text-slate-400">
+                      {Math.round(metrics.comparison.pose_quality.overall * 100)}%
+                    </span>
+                  ) : null}
+                </div>
+                <div className="space-y-1.5 px-2 py-1.5">
+                  {(metrics?.comparison?.pose_quality?.hops || []).map((hop) => {
+                    const pct = hop.score != null ? Math.round(hop.score * 100) : null;
+                    const label = hop.label || null;
+                    return (
+                      <div key={`pq-${hop.phase}-${hop.frame_idx}`}>
+                        <div className="mb-0.5 flex items-center justify-between gap-1">
+                          <span className="text-[10px] text-slate-300">
+                            {poseHopLabels[hop.phase] || hop.phase}
+                          </span>
+                          <span
+                            className={`rounded border px-1 py-px text-[9px] uppercase tracking-wide ${poseBadgeClass(label)}`}
+                          >
+                            {poseLabelText[label] || "—"}
+                            {pct != null ? ` ${pct}` : ""}
+                          </span>
+                        </div>
+                        <div className="h-1.5 overflow-hidden rounded-sm bg-editor-800">
+                          <div
+                            className={`h-full ${poseBarClass(label)}`}
+                            style={{ width: `${pct != null ? pct : 0}%` }}
+                          />
+                        </div>
+                        <PoseOverlayThumb
+                          videoName={videoName}
+                          phase={hop.phase}
+                          outputDir={outputDir}
+                          cacheKey={metrics?.derived_version ?? hop.frame_idx}
+                          title={`${poseHopLabels[hop.phase] || hop.phase} — General vs esta toma`}
+                        />
+                      </div>
+                    );
+                  })}
+                  {(() => {
+                    const ff = metrics?.comparison?.pose_quality?.final_flight;
+                    if (!ff || (ff.score == null && !ff.from_frame)) {
+                      return metrics?.comparison?.pose_quality?.hops?.length ? null : (
+                        <div className="text-[10px] text-slate-500">
+                          Sin scores de pose. Recalcula métricas.
+                        </div>
+                      );
+                    }
+                    const pct = ff.score != null ? Math.round(ff.score * 100) : null;
+                    const label = ff.label || null;
+                    const spark = (ff.samples || []).map((s) => s.score).filter((v) => v != null);
+                    return (
+                      <div className="border-t border-editor-800 pt-1.5">
+                        <div className="mb-0.5 flex items-center justify-between gap-1">
+                          <span className="text-[10px] text-slate-300">
+                            Vuelo final (H4→aterrizaje)
+                          </span>
+                          <span
+                            className={`rounded border px-1 py-px text-[9px] uppercase tracking-wide ${poseBadgeClass(label)}`}
+                          >
+                            {poseLabelText[label] || "—"}
+                            {pct != null ? ` ${pct}` : ""}
+                          </span>
+                        </div>
+                        <div className="h-1.5 overflow-hidden rounded-sm bg-editor-800">
+                          <div
+                            className={`h-full ${poseBarClass(label)}`}
+                            style={{ width: `${pct != null ? pct : 0}%` }}
+                          />
+                        </div>
+                        {spark.length > 1 ? (
+                          <div className="mt-1 flex h-5 items-end gap-px">
+                            {spark.map((sc, i) => (
+                              <div
+                                key={`spark-${i}`}
+                                className={`min-w-[3px] flex-1 rounded-sm ${poseBarClass(
+                                  sc >= 0.75 ? "buena" : sc >= 0.55 ? "regular" : "débil",
+                                )}`}
+                                style={{ height: `${Math.max(12, Math.round(sc * 100))}%` }}
+                                title={`${Math.round(sc * 100)}%`}
+                              />
+                            ))}
+                          </div>
+                        ) : null}
+                        <PoseOverlayThumb
+                          videoName={videoName}
+                          phase="final_flight"
+                          outputDir={outputDir}
+                          cacheKey={metrics?.derived_version ?? ff.from_frame}
+                          title="Vuelo final — General vs esta toma"
+                        />
+                      </div>
+                    );
+                  })()}
+                </div>
+              </div>
+
+              <div className="grid gap-1.5">
+                <button
+                  className="h-7 w-full border border-emerald-600 bg-emerald-900/30 px-2 text-left text-[11px] text-emerald-100 disabled:opacity-50"
+                  type="button"
+                  disabled={isApplyingOverrides}
+                  onClick={onApplyCorridorScale}
+                >
+                  {isApplyingOverrides ? "Aplicando..." : "Aplicar escala"}
+                </button>
+                <button
+                  className="h-7 w-full border border-slate-500 bg-editor-850 px-2 text-left text-[11px] text-slate-200 disabled:opacity-50"
+                  type="button"
+                  disabled={isComputingMetrics}
+                  onClick={onRecomputeMetrics}
+                >
+                  {isComputingMetrics ? "Recalculando..." : "Recalcular métricas"}
+                </button>
+              </div>
+            </>
+          ) : null}
+        </div>
+      ) : null}
 
       {workMode === "track" ? (
         <div className="mt-2 px-2">
@@ -3575,6 +4109,9 @@ function Inspector({
                 <div>Contactos: {contactCount}/5</div>
                 <div>Marcadores: {sections?.phase_markers?.length ?? 0}</div>
                 <div>Confianza: {sections?.confidence != null ? `${Math.round(sections.confidence * 100)}%` : "N/A"}</div>
+                <div className="text-[10px] text-slate-500">
+                  Los marcadores manuales alimentan el GT de contactos (prototipos).
+                </div>
               </div>
               {sections?.phase_markers?.length ? (
                 <div className="mt-2 grid max-h-36 gap-1 overflow-y-auto border border-editor-700 bg-editor-850 px-2 py-1.5 text-[10px] text-slate-300">
@@ -3656,7 +4193,7 @@ function Inspector({
             ) : null}
           </div>
         </div>
-      ) : (
+      ) : workMode === "athlete" ? (
       <div className="mt-2 px-2">
         <div className="mb-2 text-[11px] font-bold uppercase text-slate-300">Correccion</div>
         <div className="grid gap-1.5">
@@ -3746,7 +4283,7 @@ function Inspector({
           )}
         </div>
       </div>
-      )}
+      ) : null}
 
       {workMode === "athlete" ? (
       <div className="mt-2 px-2 grid gap-1">
@@ -3925,6 +4462,24 @@ function Inspector({
                   Sin mask_frames en calibración — aplica venue primero.
                 </span>
               ) : null}
+            </span>
+          </label>
+          <label
+            className="mt-1.5 flex items-start gap-1.5 text-[10px] leading-4 text-slate-300 cursor-pointer"
+            title="Consistencia temporal, semillas más seguras, update conservador y análisis de secciones tras el refinado"
+          >
+            <input
+              type="checkbox"
+              className="mt-0.5"
+              checked={Boolean(refineV2)}
+              disabled={isReanalyzing || isAnalyzing}
+              onChange={(e) => setRefineV2(e.target.checked)}
+            />
+            <span>
+              Refinado v2 (experimental)
+              <span className="block text-slate-500">
+                Temporal + semillas seguras + secciones. Desactívalo si empeora.
+              </span>
             </span>
           </label>
           {isReanalyzing ? <AnalysisProgress job={reanalysisJob} /> : null}

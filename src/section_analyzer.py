@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from itertools import combinations
 from pathlib import Path
 from typing import Any, Optional
 
@@ -17,6 +18,7 @@ from scipy.signal import find_peaks, savgol_filter
 
 from .calibration import load_calibration
 from .mask_utils import athlete_mask_overlap, load_mask_png
+from .gt_contacts import append_gt_from_marker, score_pose_tag
 from .phase_classifier import (
     enhance_auto_contacts_with_pose,
     propagate_from_anchors,
@@ -35,6 +37,11 @@ PEAK_PROMINENCE = 4.0
 PATCH_RADIUS = 14
 PATCH_THRESH = 0.12
 EXPECTED_CONTACTS = 5
+EXPECTED_HOPS = 4
+# Fused peak score weights: residual prominence + GT pose similarity + surface prior
+W_PROMINENCE = 0.40
+W_POSE_TAG = 0.45
+W_SURFACE = 0.15
 
 
 @dataclass
@@ -50,6 +57,9 @@ class DetectedContact:
     surface: str = "unknown"
     contact_type: str = "hop"
     confidence: float = 0.5
+    pose_sim: float = 0.0
+    landing_sim: float = 0.0
+    fused_score: float = 0.0
 
 
 @dataclass
@@ -233,6 +243,105 @@ def _contact_signal(values: list[Optional[float]]) -> list[Optional[float]]:
     return out
 
 
+def _pose_sims_for_frame(frame: dict) -> tuple[float, float, float]:
+    """Return (hop_contact_sim, landing_sim, quality) for a frame."""
+    feat = extract_pose_features(frame)
+    if not feat.valid:
+        return 0.0, 0.0, 0.0
+    hop_sim = score_pose_tag(feat.vector, "hop_contact")
+    land_sim = score_pose_tag(feat.vector, "landing")
+    # Blend with biomechanical scores already in the feature vector
+    hop_sim = 0.7 * hop_sim + 0.3 * feat.hop_contact_score
+    land_sim = 0.7 * land_sim + 0.3 * feat.landing_score
+    return hop_sim, land_sim, feat.quality
+
+
+def _local_maxima(values: list[Optional[float]], *, min_val: float = 0.35) -> list[int]:
+    """Indices of local maxima above min_val (flat plateaus take center)."""
+    out: list[int] = []
+    n = len(values)
+    for i in range(1, n - 1):
+        v = values[i]
+        if v is None or v < min_val:
+            continue
+        prev = values[i - 1]
+        nxt = values[i + 1]
+        left = prev if prev is not None else -1.0
+        right = nxt if nxt is not None else -1.0
+        if v >= left and v >= right and (v > left or v > right):
+            out.append(i)
+    return out
+
+
+def _fused_peak_score(
+    prom_norm: float,
+    pose_sim: float,
+    landing_sim: float,
+    surface: str,
+    *,
+    prefer_landing: bool = False,
+) -> float:
+    pose = landing_sim if prefer_landing else pose_sim
+    if prefer_landing:
+        surface_bonus = 1.0 if surface == "sand" else (0.35 if surface == "unknown" else 0.1)
+    else:
+        surface_bonus = (
+            1.0 if surface == "track"
+            else (0.55 if surface == "unknown" else 0.15)
+        )
+    return (
+        W_PROMINENCE * prom_norm
+        + W_POSE_TAG * pose
+        + W_SURFACE * surface_bonus
+    )
+
+
+def _build_contact_at(
+    frame: dict,
+    ctx: SectionContext,
+    *,
+    prominence: float,
+    prom_ref: float,
+) -> Optional[DetectedContact]:
+    fidx = int(frame["frame_idx"])
+    foot = _foot_point(frame)
+    if foot is None:
+        return None
+    fx, fy = foot
+    track_mask, sand_mask = ctx.load_masks(fidx)
+    surface, on_track, on_sand = _classify_surface(
+        frame, fx, fy, track_mask, sand_mask, ctx.width, ctx.height,
+    )
+    axis = ctx.axis_at(fidx)
+    bbox = frame.get("person_bbox")
+    pos_s = None
+    if bbox and len(bbox) >= 4:
+        pos_s = _project_position_s(
+            tuple(bbox[:4]), axis, ctx.width, ctx.height,
+        )
+    hop_sim, land_sim, _q = _pose_sims_for_frame(frame)
+    prom_norm = min(1.0, float(prominence) / max(prom_ref * 2.5, 1.0))
+    fused = _fused_peak_score(prom_norm, hop_sim, land_sim, surface)
+    conf = min(1.0, 0.25 + 0.55 * fused + 0.2 * hop_sim)
+    if surface != "unknown":
+        conf = min(1.0, conf + 0.1)
+    return DetectedContact(
+        frame_idx=fidx,
+        timestamp_s=float(frame.get("timestamp_s", 0)),
+        foot_x=fx,
+        foot_y=fy,
+        on_track=on_track,
+        on_sand=on_sand,
+        position_s=pos_s,
+        prominence=float(prominence),
+        surface=surface,
+        confidence=round(conf, 3),
+        pose_sim=round(hop_sim, 3),
+        landing_sim=round(land_sim, 3),
+        fused_score=round(fused, 3),
+    )
+
+
 def _detect_contacts(
     frames: list[dict],
     ctx: SectionContext,
@@ -244,63 +353,71 @@ def _detect_contacts(
     foot_ys = [_foot_y(f) for f in detected]
     signal = _contact_signal(foot_ys)
 
+    # Pose similarity series (aligned to detected[])
+    hop_sims: list[Optional[float]] = []
+    land_sims: list[Optional[float]] = []
+    for f in detected:
+        h, l, q = _pose_sims_for_frame(f)
+        if q < 0.2:
+            hop_sims.append(None)
+            land_sims.append(None)
+        else:
+            hop_sims.append(h)
+            land_sims.append(l)
+
     valid_pairs = [(i, v) for i, v in enumerate(signal) if v is not None]
-    if len(valid_pairs) < 3:
-        return []
+    prom_ref = PEAK_PROMINENCE
+    peak_local: list[tuple[int, float]] = []  # (index into detected, prominence)
 
-    indices, series = zip(*valid_pairs)
-    arr = np.array(series, dtype=float)
-    prominence = max(PEAK_PROMINENCE, float(np.std(arr)) * 0.2)
-    peak_idx, props = find_peaks(arr, prominence=prominence, distance=2)
+    if len(valid_pairs) >= 3:
+        indices, series = zip(*valid_pairs)
+        arr = np.array(series, dtype=float)
+        prom_ref = max(PEAK_PROMINENCE, float(np.std(arr)) * 0.2)
+        peak_idx, props = find_peaks(arr, prominence=prom_ref * 0.55, distance=2)
+        for pi, prom in zip(peak_idx, props["prominences"]):
+            peak_local.append((indices[pi], float(prom)))
 
-    contacts: list[DetectedContact] = []
-    last_frame_idx = -CONTACT_MIN_FRAME_GAP * 2
+    # Pose-tag local maxima as extra candidates (covers missed foot-Y peaks)
+    for li in _local_maxima(hop_sims, min_val=0.32):
+        peak_local.append((li, prom_ref * 0.8))
+    for li in _local_maxima(land_sims, min_val=0.30):
+        peak_local.append((li, prom_ref * 0.7))
 
-    for pi, prom in zip(peak_idx, props["prominences"]):
-        frame = detected[indices[pi]]
-        fidx = int(frame["frame_idx"])
-        if fidx - last_frame_idx < CONTACT_MIN_FRAME_GAP:
+    # Deduplicate nearby indices — keep highest prominence
+    peak_local.sort(key=lambda t: t[1], reverse=True)
+    kept_idx: list[tuple[int, float]] = []
+    for di, prom in peak_local:
+        fidx = int(detected[di]["frame_idx"])
+        if any(abs(fidx - int(detected[k]["frame_idx"])) < 3 for k, _ in kept_idx):
             continue
+        kept_idx.append((di, prom))
 
-        foot = _foot_point(frame)
-        if foot is None:
-            continue
-        fx, fy = foot
-
-        track_mask, sand_mask = ctx.load_masks(fidx)
-        surface, on_track, on_sand = _classify_surface(
-            frame, fx, fy, track_mask, sand_mask, ctx.width, ctx.height,
+    raw: list[DetectedContact] = []
+    for di, prom in kept_idx:
+        contact = _build_contact_at(
+            detected[di], ctx, prominence=prom, prom_ref=prom_ref,
         )
+        if contact is not None:
+            raw.append(contact)
 
-        axis = ctx.axis_at(fidx)
-        bbox = frame.get("person_bbox")
-        pos_s = None
-        if bbox and len(bbox) >= 4:
-            pos_s = _project_position_s(
-                tuple(bbox[:4]), axis, ctx.width, ctx.height,
-            )
-
-        conf = min(1.0, 0.35 + float(prom) / max(prominence * 2, 1.0))
-        if surface != "unknown":
-            conf = min(1.0, conf + 0.15)
-
-        contacts.append(DetectedContact(
-            frame_idx=fidx,
-            timestamp_s=float(frame.get("timestamp_s", 0)),
-            foot_x=fx,
-            foot_y=fy,
-            on_track=on_track,
-            on_sand=on_sand,
-            position_s=pos_s,
-            prominence=float(prom),
-            surface=surface,
-            confidence=round(conf, 3),
-        ))
-        last_frame_idx = fidx
+    # Re-rank by fused score, then enforce min frame gap (greedy keep best)
+    raw.sort(key=lambda c: c.fused_score, reverse=True)
+    contacts: list[DetectedContact] = []
+    for c in raw:
+        if any(abs(c.frame_idx - k.frame_idx) < CONTACT_MIN_FRAME_GAP for k in contacts):
+            continue
+        contacts.append(c)
+    contacts.sort(key=lambda c: c.frame_idx)
 
     if contacts:
         approach_end = _find_approach_end(contacts)
         _infer_unknown_surfaces(contacts, approach_end)
+        for c in contacts:
+            prom_norm = min(1.0, c.prominence / max(prom_ref * 2.5, 1.0))
+            c.fused_score = round(
+                _fused_peak_score(prom_norm, c.pose_sim, c.landing_sim, c.surface),
+                3,
+            )
 
     return contacts
 
@@ -385,24 +502,184 @@ def _select_jump_contacts(
     contacts: list[DetectedContact],
     approach_end: int,
 ) -> list[DetectedContact]:
-    """Pick up to 4 track hops + 1 sand landing after approach."""
-    post = sorted(
-        [c for c in contacts if c.frame_idx > approach_end],
-        key=lambda c: c.frame_idx,
-    )
-    if not post:
+    """
+    Pick exactly 4 track hops + 1 sand/final landing when possible.
+
+    Landing = last late sand contact (avoids mid-track false sand), else best
+    landing-pose peak in the final third. Hops = best spaced chain in the
+    window immediately before landing.
+    """
+    all_sorted = sorted(contacts, key=lambda c: c.frame_idx)
+    if not all_sorted:
         return []
 
-    sand = next((c for c in post if c.surface == "sand"), None)
-    if sand is None:
-        sand = post[-1]
+    last_f = all_sorted[-1].frame_idx
+    first_f = all_sorted[0].frame_idx
+    span = max(last_f - first_f, 1)
 
-    before_sand = [c for c in post if c.frame_idx < sand.frame_idx]
-    tracks = before_sand[:4]
+    # Only trust sand in the later portion (false sand early is common)
+    sand_late_cut = first_f + int(0.45 * span)
+    sand_cands = [
+        c for c in all_sorted
+        if c.surface == "sand" and c.frame_idx >= sand_late_cut
+    ]
+    if not sand_cands:
+        sand_cands = [c for c in all_sorted if c.surface == "sand"]
 
-    selected = list(tracks)
-    if sand not in selected:
-        selected.append(sand)
+    landing: Optional[DetectedContact] = None
+    if sand_cands:
+        cand = max(
+            sand_cands,
+            key=lambda c: (c.frame_idx, 0.5 * c.landing_sim + 0.5 * c.fused_score),
+        )
+        far_from_end = last_f - cand.frame_idx > max(40, int(0.25 * span))
+        if not far_from_end:
+            landing = cand
+            # Prefer a nearby stronger landing-pose peak over weak sand
+            if cand.landing_sim < 0.35:
+                cut = first_f + int(0.55 * span)
+                late = [c for c in all_sorted if c.frame_idx >= cut]
+                if late:
+                    pose_land = max(
+                        late,
+                        key=lambda c: (
+                            0.60 * c.landing_sim
+                            + 0.20 * c.fused_score
+                            + 0.20 * (c.frame_idx / max(last_f, 1))
+                        ),
+                    )
+                    if (
+                        pose_land.landing_sim > cand.landing_sim + 0.08
+                        and abs(pose_land.frame_idx - cand.frame_idx) <= 30
+                    ):
+                        landing = pose_land
+
+    if landing is None:
+        cut = first_f + int(0.60 * span)
+        late = [c for c in all_sorted if c.frame_idx >= cut] or all_sorted[-4:]
+        landing = max(
+            late,
+            key=lambda c: (
+                0.55 * c.landing_sim
+                + 0.20 * c.fused_score
+                + 0.25 * (c.frame_idx / max(last_f, 1))
+            ),
+        )
+
+    hop_window = max(90, int(0.45 * span))
+    # Soft approach floor: keep some pre-approach margin so hop_1 is not clipped
+    window_start = max(0, landing.frame_idx - hop_window)
+    if approach_end > 0:
+        window_start = min(window_start, max(0, approach_end - 5))
+    before = [
+        c for c in all_sorted
+        if window_start <= c.frame_idx < landing.frame_idx and c.surface != "sand"
+    ]
+    if len(before) < EXPECTED_HOPS:
+        before = [
+            c for c in all_sorted
+            if c.frame_idx < landing.frame_idx and c.surface != "sand"
+        ]
+
+    if not before:
+        if landing.surface == "unknown":
+            landing.surface = "sand"
+            landing.on_sand = True
+        return [landing]
+
+    def hop_score(c: DetectedContact) -> float:
+        # Real foot-Y peaks usually have prominence >> pose-only local maxima
+        prom_n = min(1.0, c.prominence / 18.0)
+        score = (
+            0.45 * c.pose_sim
+            + 0.30 * prom_n
+            + 0.15 * c.fused_score
+            + (0.05 if c.surface == "track" else 0.0)
+            + 0.05 * min(1.0, max(0, c.frame_idx - window_start) / max(hop_window, 1))
+        )
+        # Downweight high-prominence / low-pose peaks (typical approach strides)
+        if c.pose_sim < 0.30 and prom_n > 0.6:
+            score *= 0.55
+        return score
+
+    chrono = sorted(before, key=lambda c: c.frame_idx)
+    best_window: list[DetectedContact] = []
+    best_win_score = -1.0
+
+    def _interval_regularity(window: list[DetectedContact]) -> float:
+        """Prefer roughly equal hop spacings (triple-jump rhythm)."""
+        if len(window) < 2:
+            return 0.0
+        gaps = [
+            window[i + 1].frame_idx - window[i].frame_idx
+            for i in range(len(window) - 1)
+        ]
+        mean_g = sum(gaps) / len(gaps)
+        if mean_g < 1:
+            return 0.0
+        var = sum((g - mean_g) ** 2 for g in gaps) / len(gaps)
+        cv = (var ** 0.5) / mean_g
+        # Triple-jump hop spacing is typically ~12-22 analyzed frames
+        if 12 <= mean_g <= 24:
+            range_bonus = 1.0
+        elif 8 <= mean_g <= 30:
+            range_bonus = 0.55
+        else:
+            range_bonus = 0.2
+        return range_bonus * max(0.0, 1.0 - cv)
+
+    # Enumerate spaced 4-subsets (C(n,4) is tiny for ~15 candidates)
+    n = len(chrono)
+    if n >= EXPECTED_HOPS:
+        for idxs in combinations(range(n), EXPECTED_HOPS):
+            window = [chrono[j] for j in idxs]
+            ok = True
+            for a, b in zip(window, window[1:]):
+                gap = b.frame_idx - a.frame_idx
+                if gap < CONTACT_MIN_FRAME_GAP or gap > 35:
+                    ok = False
+                    break
+            if not ok:
+                continue
+            gap_to_land = landing.frame_idx - window[-1].frame_idx
+            if gap_to_land < 5 or gap_to_land > 55:
+                continue
+            # Prefer windows with ≥2 strong foot-Y peaks
+            strong = sum(1 for p in window if p.prominence >= PEAK_PROMINENCE)
+            if strong < 2:
+                continue
+            sc = sum(hop_score(p) for p in window)
+            sc += 0.15 * (1.0 - min(1.0, gap_to_land / 55.0))
+            sc += 0.55 * _interval_regularity(window)
+            sc += 0.15 * strong
+            if sc > best_win_score:
+                best_win_score = sc
+                best_window = window
+
+    if not best_window:
+        picks: list[DetectedContact] = []
+        for c in sorted(chrono, key=hop_score, reverse=True):
+            if len(picks) >= EXPECTED_HOPS:
+                break
+            if any(abs(c.frame_idx - p.frame_idx) < CONTACT_MIN_FRAME_GAP for p in picks):
+                continue
+            picks.append(c)
+        best_window = sorted(picks, key=lambda c: c.frame_idx)
+
+    picks = best_window[:EXPECTED_HOPS]
+
+    for p in picks:
+        if p.surface == "unknown":
+            p.surface = "track"
+            p.on_track = True
+
+    if landing.surface == "unknown":
+        landing.surface = "sand"
+        landing.on_sand = True
+
+    selected = list(picks)
+    if landing not in selected:
+        selected.append(landing)
     return selected[:EXPECTED_CONTACTS]
 
 
@@ -493,8 +770,12 @@ def analyze_sections(
 
     if use_pose and selected:
         contact_frames = [c.frame_idx for c in selected]
+        is_landing = [
+            (c.surface == "sand" or i == len(selected) - 1)
+            for i, c in enumerate(selected)
+        ]
         refined_frames = enhance_auto_contacts_with_pose(
-            frames, contact_frames, athlete_id=athlete_id,
+            frames, contact_frames, athlete_id=athlete_id, is_landing=is_landing,
         )
         if refined_frames and len(refined_frames) == len(selected):
             fmap = {int(f["frame_idx"]): f for f in frames}
@@ -502,7 +783,10 @@ def analyze_sections(
                 if rf in fmap:
                     selected[i].frame_idx = rf
                     selected[i].timestamp_s = float(fmap[rf].get("timestamp_s", 0))
-            notes_parts.append("Contactos refinados con pose.")
+                    hop_sim, land_sim, _q = _pose_sims_for_frame(fmap[rf])
+                    selected[i].pose_sim = round(hop_sim, 3)
+                    selected[i].landing_sim = round(land_sim, 3)
+            notes_parts.append("Contactos refinados con pose (GT hop_contact).")
 
     phases = _assign_phases(selected, approach_end, last_frame_idx)
     contacts = _serialize_contacts(selected)
@@ -602,6 +886,12 @@ def run_section_analysis(
     with open(analysis_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
+    try:
+        from .metrics import compute_metrics
+        compute_metrics(output_dir, athlete_id=sections.get("athlete_id"))
+    except Exception:
+        pass  # metrics are derived; never fail the sections write
+
     return sections
 
 
@@ -613,6 +903,28 @@ def load_sections(output_dir: Path) -> dict[str, Any]:
         return json.load(f)
 
 
+def _bump_derived_and_metrics(
+    output_dir: Path,
+    data: dict[str, Any],
+    sections: dict[str, Any],
+    analysis_path: Path,
+) -> dict[str, Any]:
+    """Bump derived_version, persist sections/analysis, recompute metrics."""
+    prev_derived = int(data.get("derived_version", 0))
+    new_derived = prev_derived + 1
+    sections["derived_version"] = new_derived
+    write_sections(output_dir, sections)
+    data["derived_version"] = new_derived
+    with open(analysis_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    try:
+        from .metrics import compute_metrics
+        compute_metrics(output_dir, athlete_id=sections.get("athlete_id"))
+    except Exception:
+        pass
+    return sections
+
+
 def mark_phase_on_frame(
     output_dir: Path,
     frame_idx: int,
@@ -622,7 +934,7 @@ def mark_phase_on_frame(
     athlete_id: Optional[str] = None,
     update_template: bool = True,
 ) -> dict[str, Any]:
-    """Assign a phase marker to a frame; rebuild phases/contacts."""
+    """Assign a phase marker to a frame; rebuild phases/contacts; append GT."""
     from .phase_classifier import add_phase_marker
 
     analysis_path = output_dir / "analysis.json"
@@ -644,27 +956,39 @@ def mark_phase_on_frame(
         athlete_id = sections["athlete_id"]
 
     ts = float(frame.get("timestamp_s", 0))
+    # Default pose_tag for hop/landing markers feeds GT store
+    effective_tag = pose_tag
+    if effective_tag is None and phase in ("hop_1", "hop_2", "hop_3", "hop_4"):
+        effective_tag = "hop_contact"
+    elif effective_tag is None and phase == "landing":
+        effective_tag = "landing"
+
     sections = add_phase_marker(
         sections, frame_idx, phase,
-        timestamp_s=ts, pose_tag=pose_tag, source="manual",
+        timestamp_s=ts, pose_tag=effective_tag, source="manual",
     )
     sections = rebuild_sections_from_markers(frames, sections)
 
     if update_template and athlete_id:
         feat = extract_pose_features(frame)
         if feat.valid:
-            update_athlete_template(athlete_id, phase, feat, pose_tag=pose_tag)
+            update_athlete_template(athlete_id, phase, feat, pose_tag=effective_tag)
 
-    prev_derived = int(data.get("derived_version", 0))
-    new_derived = prev_derived + 1
-    sections["derived_version"] = new_derived
-    write_sections(output_dir, sections)
+    # Durable GT: survive video delete; rebuild hop_contact centroid from samples
+    video_id = output_dir.name.replace("_refined", "")
+    surface = "sand" if phase == "landing" else "track"
+    append_gt_from_marker(
+        video_id,
+        frame,
+        phase,
+        pose_tag=effective_tag,
+        athlete_id=athlete_id,
+        surface=surface,
+        source="manual_mark",
+        rebuild_prototypes=True,
+    )
 
-    data["derived_version"] = new_derived
-    with open(analysis_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-
-    return sections
+    return _bump_derived_and_metrics(output_dir, data, sections, analysis_path)
 
 
 def move_phase_marker_on_frame(
@@ -683,19 +1007,32 @@ def move_phase_marker_on_frame(
         raise ValueError(f"Frame {to_frame_idx} not found in analysis.json")
 
     sections = load_sections(output_dir)
+    # Capture phase before move for GT upsert
+    moved = next(
+        (m for m in (sections.get("phase_markers") or []) if int(m["frame_idx"]) == from_frame_idx),
+        None,
+    )
     sections = move_phase_marker(sections, from_frame_idx, to_frame_idx, frames)
     sections = rebuild_sections_from_markers(frames, sections)
 
-    prev_derived = int(data.get("derived_version", 0))
-    new_derived = prev_derived + 1
-    sections["derived_version"] = new_derived
-    write_sections(output_dir, sections)
+    if moved and moved.get("phase") in ("hop_1", "hop_2", "hop_3", "hop_4", "landing"):
+        phase = moved["phase"]
+        pose_tag = moved.get("pose_tag") or (
+            "landing" if phase == "landing" else "hop_contact"
+        )
+        video_id = output_dir.name.replace("_refined", "")
+        append_gt_from_marker(
+            video_id,
+            fmap[to_frame_idx],
+            phase,
+            pose_tag=pose_tag,
+            athlete_id=sections.get("athlete_id"),
+            surface="sand" if phase == "landing" else "track",
+            source="manual_move",
+            rebuild_prototypes=True,
+        )
 
-    data["derived_version"] = new_derived
-    with open(analysis_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-
-    return sections
+    return _bump_derived_and_metrics(output_dir, data, sections, analysis_path)
 
 
 def unmark_phase_frame(output_dir: Path, frame_idx: int) -> dict[str, Any]:
@@ -710,16 +1047,7 @@ def unmark_phase_frame(output_dir: Path, frame_idx: int) -> dict[str, Any]:
     sections = remove_phase_marker(sections, frame_idx)
     sections = rebuild_sections_from_markers(frames, sections)
 
-    prev_derived = int(data.get("derived_version", 0))
-    new_derived = prev_derived + 1
-    sections["derived_version"] = new_derived
-    write_sections(output_dir, sections)
-
-    data["derived_version"] = new_derived
-    with open(analysis_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-
-    return sections
+    return _bump_derived_and_metrics(output_dir, data, sections, analysis_path)
 
 
 def run_phase_propagation(output_dir: Path) -> dict[str, Any]:
@@ -734,13 +1062,4 @@ def run_phase_propagation(output_dir: Path) -> dict[str, Any]:
     sections = propagate_from_anchors(frames, sections, athlete_id=athlete_id)
     sections = rebuild_sections_from_markers(frames, sections)
 
-    prev_derived = int(data.get("derived_version", 0))
-    new_derived = prev_derived + 1
-    sections["derived_version"] = new_derived
-    write_sections(output_dir, sections)
-
-    data["derived_version"] = new_derived
-    with open(analysis_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-
-    return sections
+    return _bump_derived_and_metrics(output_dir, data, sections, analysis_path)

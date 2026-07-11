@@ -29,6 +29,7 @@ What this module does differently:
 from __future__ import annotations
 
 import json
+import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -60,6 +61,46 @@ MIN_SIMILARITY_WITH_MASKS = 0.20  # slightly lower floor when venue masks bias s
 TRACK_OV_WEIGHT  = 0.30
 SAND_OV_WEIGHT   = 0.20
 MASK_CAL_MODES   = ("color_masks", "cnn_masks", "keyframe_masks")
+
+# refine_v2-only knobs (classic path never reads these)
+V2_TEMPORAL_IOU_WEIGHT = 0.12
+V2_TEMPORAL_CLOSE_GAP = 0.08       # amplify temporal when top scores within this gap
+
+# Mid-window clothing lock (progress through refine analysis frames)
+V2_MID_WINDOW = (0.30, 0.90)       # learn / strengthen appearance here
+V2_LANDING_TAIL = 0.90             # sand/landing zone starts here
+
+# Mid-window: aggressive online appearance updates (clothing lock)
+# Early + landing: online appearance is frozen (no contamination)
+V2_MID_ONLINE_MIN_CONF = 0.70
+V2_MID_ONLINE_MIN_SIM = 0.55
+V2_MID_ONLINE_MIN_MASK_AREA = 8000
+V2_MID_ONLINE_MIN_TRACK_OV = 0.25
+
+# Landing / sand tail: permissive selection, never learn appearance
+V2_LANDING_SAND_WEIGHT = 0.45      # vs SAND_OV_WEIGHT 0.20
+V2_LANDING_MIN_SIM = 0.15          # with venue masks
+V2_LANDING_MIN_SIM_NO_MASK = 0.18  # appearance-only
+V2_TEMPORAL_BOOST_LANDING = 0.28   # stronger prev-track preference when blurred/close
+V2_LANDING_TEMPORAL_HISTORY = 4    # IoU vs recent chosen bboxes (wider search)
+V2_LANDING_SAND_PREFER = 0.10      # extra score boost for high sand_ov in landing
+
+# Gap fill / early re-score (post mid-lock propagation into early + landing unknowns)
+V2_GAP_MIN_BBOX_AREA = 600         # distant early athlete often << classic MIN_BBOX_AREA
+V2_GAP_IOU_WEIGHT = 0.50           # strong temporal prior vs next-known / expected bbox
+V2_GAP_CENTER_WEIGHT = 0.18        # soft center proximity vs expected
+V2_GAP_MIN_SIM = 0.08              # appearance floor during gap fill
+V2_GAP_MIN_SIM_RELAXED = 0.04      # when IoU / sand / track overlap is strong
+V2_GAP_HIGH_IOU = 0.22             # IoU vs expected → allow relaxed appearance
+V2_GAP_HIGH_SAND = 0.25
+V2_GAP_HIGH_TRACK = 0.28
+V2_GAP_ACCEPT_IOU = 0.20           # accept via IoU alone (locked identity + temporal)
+V2_GAP_ACCEPT_TRACK = 0.28         # accept via track overlap alone
+V2_GAP_DEBUG_EARLY = 10            # log top candidates for this many early fills
+V2_QUALITY_FLOOR = 0.15            # never leave Q=0 when person_detected + bbox
+V2_EARLY_RESCORE_MAX_Q = 0.35      # re-score early found frames below this quality
+V2_TRACKING_SRC = "refined_v2"
+V2_TRACKING_SRC_BBOX = "refined_v2_bbox_only"
 
 
 @dataclass
@@ -133,9 +174,565 @@ class VenueMaskBias:
         return float(track_ov), float(sand_ov)
 
 
-def _blend_mask_score(appearance_sim: float, track_ov: float, sand_ov: float) -> float:
-    """Combine appearance with venue overlap. score = sim + 0.30*track + 0.20*sand."""
-    return float(appearance_sim + TRACK_OV_WEIGHT * track_ov + SAND_OV_WEIGHT * sand_ov)
+def _blend_mask_score(
+    appearance_sim: float,
+    track_ov: float,
+    sand_ov: float,
+    sand_weight: float = SAND_OV_WEIGHT,
+) -> float:
+    """Combine appearance with venue overlap. score = sim + 0.30*track + sand_w*sand."""
+    return float(appearance_sim + TRACK_OV_WEIGHT * track_ov + sand_weight * sand_ov)
+
+
+def _v2_zone(frame_progress: float) -> str:
+    """Map refine-run progress [0,1] → early | mid | landing (refine_v2 only)."""
+    if frame_progress >= V2_LANDING_TAIL:
+        return "landing"
+    if V2_MID_WINDOW[0] <= frame_progress < V2_MID_WINDOW[1]:
+        return "mid"
+    return "early"
+
+
+def _bbox_iou(
+    a: tuple[float, float, float, float],
+    b: tuple[float, float, float, float],
+) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - inter
+    return float(inter / union) if union > 0 else 0.0
+
+
+def _bbox_lerp(
+    a: tuple[float, float, float, float],
+    b: tuple[float, float, float, float],
+    t: float,
+) -> tuple[float, float, float, float]:
+    """Linear interpolate bbox corners; t in [0, 1]."""
+    t = max(0.0, min(1.0, float(t)))
+    return tuple(a[i] + (b[i] - a[i]) * t for i in range(4))  # type: ignore[return-value]
+
+
+def _v2_bbox_only_quality(
+    det_conf: float,
+    mask_area: int,
+    appearance_sim: float,
+) -> float:
+    """Quality when identity is locked via bbox/mask but pose is missing."""
+    return round(
+        max(
+            0.20,
+            min(
+                0.48,
+                0.18
+                + 0.22 * float(det_conf)
+                + 0.12 * min(1.0, mask_area / 30000.0)
+                + 0.12 * float(appearance_sim),
+            ),
+        ),
+        3,
+    )
+
+
+def _v2_build_frame_analysis(
+    image: np.ndarray,
+    frame_idx: int,
+    timestamp_s: float,
+    model_pose,
+    bbox: tuple[int, int, int, int],
+    seg_mask: Optional[np.ndarray],
+    det_conf: float,
+    best_sim: float,
+) -> FrameAnalysis:
+    """
+    Pose on crop → FrameAnalysis. Pose failure still yields person_detected
+    with bbox/mask (tracking_source refined_v2_bbox_only).
+    """
+    x1, y1, x2, y2 = bbox
+    mask_area = int(seg_mask.sum()) if seg_mask is not None else 0
+
+    kps_xy_full = kps_conf = None
+    quality = 0.0
+    pose_ok = False
+
+    crop, (ox, oy, _) = _padded_crop(image, x1, y1, x2, y2)
+    if crop.size > 0:
+        pose_results = model_pose(crop, verbose=False, conf=0.25)
+        if (pose_results and pose_results[0].keypoints is not None
+                and len(pose_results[0].keypoints.xy) > 0):
+            kp_data = pose_results[0].keypoints
+            crop_boxes = pose_results[0].boxes
+            best_crop = 0
+            if crop_boxes is not None and len(crop_boxes) > 1:
+                crop_areas = [
+                    (b[2] - b[0]) * (b[3] - b[1])
+                    for b in crop_boxes.xyxy.cpu().numpy()
+                ]
+                best_crop = int(np.argmax(crop_areas))
+            kps_xy_crop = kp_data.xy.cpu().numpy()[best_crop]
+            kps_conf = kp_data.conf.cpu().numpy()[best_crop]
+            kps_xy_full = kps_xy_crop.copy()
+            kps_xy_full[:, 0] += ox
+            kps_xy_full[:, 1] += oy
+            n_valid = int((kps_conf >= 0.45).sum())
+            quality = round(
+                0.45 * n_valid / 17.0
+                + 0.30 * float(det_conf)
+                + 0.15 * min(1.0, mask_area / 30000.0)
+                + 0.10 * float(best_sim),
+                3,
+            )
+            pose_ok = True
+
+    if not pose_ok:
+        quality = _v2_bbox_only_quality(det_conf, mask_area, best_sim)
+
+    tracker_result = {
+        "found":          True,
+        "track_id":       None,
+        "bbox":           (x1, y1, x2, y2),
+        "mask_area_px":   mask_area,
+        "crop_offset":    (0, 0),
+        "kps_xy":         kps_xy_full,
+        "kps_conf":       kps_conf,
+        "seg_mask":       seg_mask,
+        "quality_score":  quality,
+        "appearance_sim": round(float(best_sim), 3),
+    }
+    fa = analyze_frame_from_tracker(
+        frame_idx=frame_idx,
+        timestamp_s=timestamp_s,
+        tracker_result=tracker_result,
+    )
+    fa.tracking_source = V2_TRACKING_SRC if pose_ok else V2_TRACKING_SRC_BBOX
+    fa._appearance_sim = round(float(best_sim), 3)  # type: ignore[attr-defined]
+    # analyze_frame_from_tracker may overwrite quality via angle (UNKNOWN→~0);
+    # keep a floor whenever we locked a bbox identity.
+    if fa.person_detected and fa.person_bbox is not None:
+        if fa.quality_score < V2_QUALITY_FLOOR:
+            fa.quality_score = max(
+                V2_QUALITY_FLOOR,
+                _v2_bbox_only_quality(det_conf, mask_area, best_sim),
+            )
+    return fa
+
+
+def _v2_progress(i: int, n: int) -> float:
+    if n <= 1:
+        return 0.5
+    return i / (n - 1)
+
+
+def _v2_expected_bbox(
+    analyses: list[FrameAnalysis],
+    idx: int,
+) -> Optional[tuple[float, float, float, float]]:
+    """Interpolate (or copy) bbox from nearest known left/right neighbors."""
+    left_i = right_i = None
+    for j in range(idx - 1, -1, -1):
+        if analyses[j].person_detected and analyses[j].person_bbox is not None:
+            left_i = j
+            break
+    for j in range(idx + 1, len(analyses)):
+        if analyses[j].person_detected and analyses[j].person_bbox is not None:
+            right_i = j
+            break
+    if left_i is None and right_i is None:
+        return None
+    if left_i is None:
+        return tuple(float(v) for v in analyses[right_i].person_bbox)  # type: ignore[index]
+    if right_i is None:
+        return tuple(float(v) for v in analyses[left_i].person_bbox)
+    span = right_i - left_i
+    t = (idx - left_i) / span if span > 0 else 0.0
+    lb = tuple(float(v) for v in analyses[left_i].person_bbox)
+    rb = tuple(float(v) for v in analyses[right_i].person_bbox)
+    return _bbox_lerp(lb, rb, t)  # type: ignore[arg-type]
+
+
+def _v2_expected_bbox_backward(
+    analyses: list[FrameAnalysis],
+    idx: int,
+) -> Optional[tuple[float, float, float, float]]:
+    """
+    When walking early←mid, seed expected from the next-in-time known bbox
+    (idx+1 already filled or mid anchor), not sparse left/right interpolate.
+    """
+    if idx + 1 < len(analyses):
+        nxt = analyses[idx + 1]
+        if nxt.person_detected and nxt.person_bbox is not None:
+            return tuple(float(v) for v in nxt.person_bbox)
+    return _v2_expected_bbox(analyses, idx)
+
+
+def _v2_gap_select_candidate(
+    image: np.ndarray,
+    frame_idx: int,
+    model_seg,
+    appearance: RobustAppearanceModel,
+    mask_bias: Optional[VenueMaskBias],
+    expected_bbox: Optional[tuple[float, float, float, float]],
+    zone: str,
+    debug: bool = False,
+) -> Optional[tuple[tuple[int, int, int, int], Optional[np.ndarray], float, float]]:
+    """
+    YOLO seg + locked appearance + mask + IoU vs expected bbox.
+    Returns (bbox_int, seg_mask, det_conf, best_sim) or None.
+
+    Accept when appearance clears the floor OR IoU vs expected is decent
+    OR track overlap is strong — so distant early frames are not dropped
+    solely for low clothing sim (classic MIN_BBOX_AREA also relaxed here).
+    """
+    results = model_seg(image, classes=[0], conf=0.25, verbose=False)
+    if not results or results[0].boxes is None:
+        if debug:
+            print(f"  [v2 gap dbg] frame={frame_idx}: no YOLO boxes")
+        return None
+
+    res = results[0]
+    bboxes = res.boxes.xyxy.cpu().numpy()
+    confs = res.boxes.conf.cpu().numpy()
+    areas = [(b[2] - b[0]) * (b[3] - b[1]) for b in bboxes]
+    valid = [i for i, a in enumerate(areas) if a >= V2_GAP_MIN_BBOX_AREA]
+    if not valid:
+        if debug:
+            print(
+                f"  [v2 gap dbg] frame={frame_idx}: all {len(bboxes)} dets "
+                f"below V2_GAP_MIN_BBOX_AREA={V2_GAP_MIN_BBOX_AREA} "
+                f"(areas={[int(a) for a in areas]})"
+            )
+        return None
+
+    h, w = image.shape[:2]
+    det_masks: list[Optional[np.ndarray]] = []
+    for i in range(len(bboxes)):
+        if res.masks is not None and i < len(res.masks.data):
+            mt = res.masks.data[i].cpu().numpy()
+            m = cv2.resize(mt, (w, h), interpolation=cv2.INTER_NEAREST).astype(bool)
+            det_masks.append(m)
+        else:
+            det_masks.append(None)
+
+    in_landing = zone == "landing"
+    sand_w = V2_LANDING_SAND_WEIGHT if in_landing else SAND_OV_WEIGHT
+
+    scored: list[tuple] = []
+    rejected: list[str] = []
+    for i in valid:
+        bbox = tuple(float(v) for v in bboxes[i])
+        sim = appearance.similarity(
+            image, mask=det_masks[i], bbox=tuple(int(v) for v in bbox),
+        )
+        track_ov = sand_ov = 0.0
+        if mask_bias is not None:
+            track_ov, sand_ov = mask_bias.overlaps(
+                frame_idx, bbox, det_masks[i], w, h,
+            )
+        combined = (
+            _blend_mask_score(sim, track_ov, sand_ov, sand_weight=sand_w)
+            if mask_bias is not None else float(sim)
+        )
+        iou = _bbox_iou(bbox, expected_bbox) if expected_bbox is not None else 0.0
+        combined += V2_GAP_IOU_WEIGHT * iou
+        if in_landing and sand_ov > 0.0:
+            combined += V2_LANDING_SAND_PREFER * sand_ov
+        dist_n = 0.0
+        # center proximity soft boost when expected exists
+        if expected_bbox is not None:
+            ecx = 0.5 * (expected_bbox[0] + expected_bbox[2])
+            ecy = 0.5 * (expected_bbox[1] + expected_bbox[3])
+            cx = 0.5 * (bbox[0] + bbox[2])
+            cy = 0.5 * (bbox[1] + bbox[3])
+            diag = max(1.0, float(np.hypot(w, h)))
+            dist_n = float(np.hypot(cx - ecx, cy - ecy)) / diag
+            combined += V2_GAP_CENTER_WEIGHT * max(0.0, 1.0 - dist_n * 4.0)
+            # Penalize high-appearance spectators far from the temporal prior
+            # so they cannot beat a weaker-sim athlete near the expected bbox.
+            if iou < 0.05 and dist_n > 0.12:
+                combined -= 0.20
+
+        relax = (
+            iou >= V2_GAP_HIGH_IOU
+            or sand_ov >= V2_GAP_HIGH_SAND
+            or track_ov >= V2_GAP_HIGH_TRACK
+        )
+        min_sim = V2_GAP_MIN_SIM_RELAXED if relax else V2_GAP_MIN_SIM
+        accept = (
+            sim >= min_sim
+            or iou >= V2_GAP_ACCEPT_IOU
+            or track_ov >= V2_GAP_ACCEPT_TRACK
+            or (
+                sim >= V2_GAP_MIN_SIM_RELAXED
+                and (iou >= 0.12 or track_ov >= 0.18 or sand_ov >= V2_GAP_HIGH_SAND)
+            )
+        )
+        # With a temporal prior, do not let a weak appearance-only match jump
+        # to a distant spectator (poisons the backward chain). Prefer leaving
+        # the frame empty over locking the wrong person.
+        if (
+            accept
+            and expected_bbox is not None
+            and iou < 0.08
+            and track_ov < 0.15
+            and dist_n > 0.08
+            and sim < 0.22
+        ):
+            accept = False
+        if not accept:
+            rejected.append(
+                f"i={i} area={areas[i]:.0f} sim={sim:.3f} "
+                f"iou={iou:.2f} track={track_ov:.2f} dist={dist_n:.2f}"
+            )
+            continue
+        scored.append((i, sim, combined, track_ov, sand_ov, iou, areas[i]))
+
+    if debug:
+        top = sorted(scored, key=lambda x: x[2], reverse=True)[:4]
+        print(
+            f"  [v2 gap dbg] frame={frame_idx} zone={zone} "
+            f"ndet={len(bboxes)} valid={len(valid)} accepted={len(scored)} "
+            f"expected={'yes' if expected_bbox is not None else 'no'}"
+        )
+        for i, sim, comb, tov, sov, iou, area in top:
+            print(
+                f"    cand i={i} area={area:.0f} sim={sim:.3f} "
+                f"iou={iou:.2f} track={tov:.2f} sand={sov:.2f} score={comb:.3f}"
+            )
+        for line in rejected[:5]:
+            print(f"    reject {line}")
+
+    if not scored:
+        if debug:
+            print(f"  [v2 gap dbg] frame={frame_idx}: no accepted candidates — skip fill")
+        return None
+
+    # Prefer temporal continuity when expected exists: among near-tied scores,
+    # pick the higher-IoU candidate so clothing-similar spectators lose.
+    best = max(scored, key=lambda x: x[2])
+    if expected_bbox is not None:
+        high_iou = [s for s in scored if s[5] >= V2_GAP_ACCEPT_IOU]
+        if high_iou:
+            best_iou_cand = max(high_iou, key=lambda x: (x[5], x[2]))
+            if best[5] < 0.08 and best_iou_cand[2] >= best[2] - 0.12:
+                best = best_iou_cand
+
+    best_i, best_sim, _, _, _, best_iou, _ = best
+    x1, y1, x2, y2 = (int(v) for v in bboxes[best_i])
+    seg_mask = det_masks[best_i]
+    if seg_mask is not None:
+        ys, xs = np.where(seg_mask)
+        if len(xs) > 0:
+            x1, x2 = int(xs.min()), int(xs.max())
+            y1, y2 = int(ys.min()), int(ys.max())
+    if debug:
+        print(
+            f"  [v2 gap dbg] frame={frame_idx}: FILL bbox=({x1},{y1},{x2},{y2}) "
+            f"sim={best_sim:.3f} iou={best_iou:.2f}"
+        )
+    return (x1, y1, x2, y2), seg_mask, float(confs[best_i]), float(best_sim)
+
+
+def _v2_gap_fill_pass(
+    analyses: list[FrameAnalysis],
+    frames_dir: Path,
+    model_seg,
+    model_pose,
+    appearance: RobustAppearanceModel,
+    mask_bias: Optional[VenueMaskBias],
+    annotate_every: int,
+    annotated_dir: Path,
+) -> dict:
+    """
+    After primary refine_v2: propagate mid-window identity into early/landing gaps.
+
+    Mid successes are anchors. Walk backward into early unknowns (expected bbox
+    seeded from the next-in-time filled frame), then forward into landing
+    unknowns. Empty frames (and weak early finds) are re-scored with the locked
+    mid appearance model + temporal prior + venue masks. Pose failure still
+    keeps bbox identity (refined_v2_bbox_only).
+    """
+    n = len(analyses)
+    if n == 0:
+        return {
+            "mid_anchors": 0, "filled_early": 0, "filled_late": 0,
+            "bbox_only": 0, "rescored_early": 0,
+        }
+
+    mid_idxs = [
+        i for i in range(n)
+        if _v2_zone(_v2_progress(i, n)) == "mid"
+        and analyses[i].person_detected
+        and analyses[i].person_bbox is not None
+    ]
+    mid_anchors = len(mid_idxs)
+    if mid_anchors == 0:
+        print("  [Reanalyzer v2] Gap fill: no mid anchors — skipped")
+        return {
+            "mid_anchors": 0, "filled_early": 0, "filled_late": 0,
+            "bbox_only": 0, "rescored_early": 0,
+        }
+
+    first_mid = mid_idxs[0]
+    last_mid = mid_idxs[-1]
+
+    def _needs_fill(i: int) -> bool:
+        fa = analyses[i]
+        zone = _v2_zone(_v2_progress(i, n))
+        if not fa.person_detected:
+            return True
+        # Light early re-score with locked mid clothing model
+        if zone == "early" and fa.quality_score < V2_EARLY_RESCORE_MAX_Q:
+            return True
+        return False
+
+    # Bidirectional order: early ← mid, then mid → landing
+    early_order = list(range(first_mid - 1, -1, -1))
+    late_order = list(range(last_mid + 1, n))
+
+    filled_early = filled_late = rescored_early = bbox_only = 0
+    early_debug_left = V2_GAP_DEBUG_EARLY
+
+    def _process(i: int, side: str) -> None:
+        nonlocal filled_early, filled_late, rescored_early, bbox_only, early_debug_left
+        if not _needs_fill(i):
+            return
+        zone = _v2_zone(_v2_progress(i, n))
+        fa_old = analyses[i]
+        was_detected = fa_old.person_detected
+
+        fpath = frames_dir / f"frame_{fa_old.frame_idx:06d}.jpg"
+        if not fpath.exists():
+            print(
+                f"  [v2 gap dbg] frame={fa_old.frame_idx}: missing file {fpath.name} — skip"
+            )
+            return
+        image = cv2.imread(str(fpath))
+        if image is None:
+            return
+
+        # Backward walk: seed from next-known (forward neighbor already filled).
+        # Forward/landing: interpolate / left-neighbor continuity.
+        if side == "early":
+            expected = _v2_expected_bbox_backward(analyses, i)
+        else:
+            expected = _v2_expected_bbox(analyses, i)
+            if zone == "landing" and expected is None:
+                for j in range(i - 1, -1, -1):
+                    if analyses[j].person_detected and analyses[j].person_bbox is not None:
+                        expected = tuple(float(v) for v in analyses[j].person_bbox)
+                        break
+
+        debug = side == "early" and early_debug_left > 0
+        if debug:
+            early_debug_left -= 1
+
+        picked = _v2_gap_select_candidate(
+            image, fa_old.frame_idx, model_seg, appearance, mask_bias,
+            expected, zone, debug=debug,
+        )
+        if picked is None:
+            if debug:
+                print(f"  [v2 gap dbg] frame={fa_old.frame_idx}: fill NOT applied")
+            return
+        bbox, seg_mask, det_conf, best_sim = picked
+
+        # If replacing a weak early find, require improved appearance or IoU
+        if was_detected and zone == "early":
+            old_sim = float(getattr(fa_old, "_appearance_sim", 0.0) or 0.0)
+            iou_exp = (
+                _bbox_iou(tuple(float(v) for v in bbox), expected)
+                if expected is not None else 0.0
+            )
+            if best_sim + 0.05 < old_sim and iou_exp < V2_GAP_HIGH_IOU:
+                if debug:
+                    print(
+                        f"  [v2 gap dbg] frame={fa_old.frame_idx}: keep old "
+                        f"(sim {best_sim:.3f} vs old {old_sim:.3f}, iou={iou_exp:.2f})"
+                    )
+                return
+
+        fa_new = _v2_build_frame_analysis(
+            image, fa_old.frame_idx, fa_old.timestamp_s, model_pose,
+            bbox, seg_mask, det_conf, best_sim,
+        )
+        analyses[i] = fa_new
+
+        if fa_new.tracking_source == V2_TRACKING_SRC_BBOX:
+            bbox_only += 1
+        if side == "early":
+            if was_detected:
+                rescored_early += 1
+            else:
+                filled_early += 1
+            if debug:
+                print(
+                    f"  [v2 gap dbg] frame={fa_new.frame_idx}: applied "
+                    f"src={fa_new.tracking_source} Q={fa_new.quality_score:.2f} "
+                    f"det={fa_new.person_detected}"
+                )
+        else:
+            filled_late += 1
+
+        if annotate_every > 0 and (i % annotate_every == 0):
+            out_img = annotated_dir / f"annotated_{fa_new.frame_idx:06d}.jpg"
+            annotate_frame(
+                str(fpath), fa_new, str(out_img),
+                seg_mask=None,
+                appearance_sim=float(getattr(fa_new, "_appearance_sim", 0.0) or 0.0),
+            )
+
+    print(
+        f"  [Reanalyzer v2] Gap fill walk: early←mid "
+        f"({len(early_order)} frames from idx {first_mid - 1}→0), "
+        f"mid→landing ({len(late_order)} frames)"
+    )
+    for i in early_order:
+        _process(i, "early")
+    for i in late_order:
+        _process(i, "late")
+
+    # Count bbox-only across full run (gap fill + primary) for logging below
+    bbox_only_total = sum(
+        1 for a in analyses
+        if a.person_detected and a.tracking_source == V2_TRACKING_SRC_BBOX
+    )
+
+    print(
+        f"  [Reanalyzer v2] Gap fill: mid_anchors={mid_anchors}, "
+        f"filled_early={filled_early}, filled_late={filled_late}, "
+        f"rescored_early={rescored_early}, "
+        f"bbox_only_gap={bbox_only}, bbox_only_total={bbox_only_total}"
+    )
+    return {
+        "mid_anchors": mid_anchors,
+        "filled_early": filled_early,
+        "filled_late": filled_late,
+        "bbox_only": bbox_only_total,
+        "rescored_early": rescored_early,
+    }
+
+
+def _copy_venue_assets_for_sections(original_dir: Path, refined_dir: Path) -> None:
+    """Copy calibration.json + venue_masks/ so section analysis can use track/sand."""
+    src_cal = original_dir / "calibration.json"
+    if src_cal.exists():
+        shutil.copy2(src_cal, refined_dir / "calibration.json")
+        print(f"  [Reanalyzer v2] Copied calibration.json → {refined_dir.name}/")
+    src_masks = original_dir / "venue_masks"
+    if src_masks.is_dir():
+        dst_masks = refined_dir / "venue_masks"
+        if dst_masks.exists():
+            shutil.rmtree(dst_masks)
+        shutil.copytree(src_masks, dst_masks)
+        print(f"  [Reanalyzer v2] Copied venue_masks/ → {refined_dir.name}/")
 
 
 # ─── Robust appearance model ──────────────────────────────────────────────────
@@ -305,6 +902,7 @@ class ReanalysisConfig:
     seed_start_frame:    Optional[int] = None   # restrict seed to this interval
     seed_end_frame:      Optional[int] = None   # (both must be set to take effect)
     use_cnn_masks:       bool  = False          # bias selection with venue mask_frames
+    refine_v2:           bool  = False          # experimental: temporal + safer seeds + sections
 
 
 # ─── Seed phase ───────────────────────────────────────────────────────────────
@@ -317,6 +915,7 @@ def _seed_appearance(
     seed_start_frame: Optional[int] = None,
     seed_end_frame:   Optional[int] = None,
     mask_bias: Optional[VenueMaskBias] = None,
+    refine_v2: bool = False,
 ) -> Optional[RobustAppearanceModel]:
     """
     Build an AppearanceModel from the N highest-quality frames of the
@@ -327,6 +926,11 @@ def _seed_appearance(
     user knows a specific interval where detection was clean.
     Frames outside that interval are still used as fallback if the
     interval yields fewer than max_frames candidates.
+
+    When refine_v2: prefer manually_corrected frames as seed positives,
+    prefer frames in the mid-window (30–90% of first-pass span) for clothing
+    lock, and prefer high track-overlap detections when venue masks are available.
+    Still requires ≥2 positive refs (RobustAppearanceModel.is_ready).
     """
     analysis_path = Path(original_output_dir) / "analysis.json"
     if not analysis_path.exists():
@@ -347,24 +951,45 @@ def _seed_appearance(
     def _in_interval(fr) -> bool:
         return seed_start_frame <= fr.get("frame_idx", -1) <= seed_end_frame
 
+    # refine_v2 mid-window span over first-pass frame indices (clothing lock seed)
+    mid_lo = mid_hi = None
+    if refine_v2 and frames_data:
+        idxs = [fr.get("frame_idx", 0) for fr in frames_data]
+        span_lo, span_hi = min(idxs), max(idxs)
+        span = max(span_hi - span_lo, 1)
+        mid_lo = span_lo + int(span * V2_MID_WINDOW[0])
+        mid_hi = span_lo + int(span * V2_MID_WINDOW[1])
+
+    def _in_mid_window(fr) -> bool:
+        if mid_lo is None:
+            return False
+        return mid_lo <= fr.get("frame_idx", -1) <= mid_hi
+
+    def _quality_key(fr):
+        # refine_v2: manually_corrected frames rank above quality alone;
+        # mid-window frames preferred next (stable clothing view).
+        manual_boost = 10.0 if (refine_v2 and fr.get("manually_corrected")) else 0.0
+        mid_boost = 3.0 if (refine_v2 and _in_mid_window(fr)) else 0.0
+        return (manual_boost, mid_boost, fr.get("quality_score", 0))
+
     if use_interval:
         # Priority 1: good frames inside the user-defined interval
         interval_good = sorted(
             [fr for fr in frames_data if _is_good(fr) and _in_interval(fr)],
-            key=lambda x: x["quality_score"], reverse=True,
+            key=_quality_key, reverse=True,
         )
         # Priority 2: any detected frame inside the interval
         interval_any = sorted(
             [fr for fr in frames_data if fr.get("person_detected") and _in_interval(fr)
              and fr not in interval_good],
-            key=lambda x: x.get("quality_score", 0), reverse=True,
+            key=_quality_key, reverse=True,
         )
         combined = (interval_good + interval_any)[:max_frames]
         # If the interval is thin, pad with the best frames from the whole video
         if len(combined) < max_frames:
             rest = sorted(
                 [fr for fr in frames_data if _is_good(fr) and fr not in combined],
-                key=lambda x: x["quality_score"], reverse=True,
+                key=_quality_key, reverse=True,
             )
             combined = (combined + rest)[:max_frames]
         seed_candidates = combined
@@ -373,15 +998,33 @@ def _seed_appearance(
     else:
         usable = sorted(
             [fr for fr in frames_data if _is_good(fr)],
-            key=lambda x: x["quality_score"], reverse=True,
+            key=_quality_key, reverse=True,
         )
         seed_candidates = usable[:max_frames]
+        if refine_v2 and mid_lo is not None:
+            n_mid = sum(1 for fr in seed_candidates if _in_mid_window(fr))
+            print(
+                f"  [Reanalyzer v2] Mid-window seed bias "
+                f"[{mid_lo}–{mid_hi}]: {n_mid}/{len(seed_candidates)} seeds in mid-window"
+            )
+
+    # refine_v2: if manually_corrected frames exist, put them first (still need ≥2)
+    if refine_v2:
+        manual = [
+            fr for fr in frames_data
+            if fr.get("manually_corrected") and fr.get("person_detected")
+        ]
+        if manual:
+            seen = {fr["frame_idx"] for fr in manual}
+            rest = [fr for fr in seed_candidates if fr["frame_idx"] not in seen]
+            seed_candidates = (manual + rest)[:max_frames]
+            print(f"  [Reanalyzer v2] Preferring {len(manual)} manually_corrected seed frames")
 
     if not seed_candidates:
         # last-resort fallback
         seed_candidates = sorted(
             [fr for fr in frames_data if fr.get("person_detected")],
-            key=lambda x: x.get("quality_score", 0),
+            key=_quality_key,
             reverse=True,
         )[:max_frames]
 
@@ -425,12 +1068,19 @@ def _seed_appearance(
             return None
 
         # Prefer largest detection; with masks, boost by track/sand overlap
+        # refine_v2: stronger preference for high track overlap over pure area
         def _seed_rank(i):
             area = areas[i]
             if mask_bias is None:
                 return area
             bbox = tuple(float(v) for v in bboxes[i])
             track_ov, sand_ov = mask_bias.overlaps(fidx, bbox, _get_mask(i), w, h)
+            if refine_v2:
+                return (
+                    area * (1.0 + 1.5 * TRACK_OV_WEIGHT * track_ov
+                            + SAND_OV_WEIGHT * sand_ov)
+                    + 50_000.0 * track_ov
+                )
             return area * (1.0 + TRACK_OV_WEIGHT * track_ov + SAND_OV_WEIGHT * sand_ov)
 
         best = max(valid, key=_seed_rank)
@@ -604,6 +1254,178 @@ def _analyze_frame_refined(
     return fa
 
 
+def _analyze_frame_refined_v2(
+    image: np.ndarray,
+    frame_idx: int,
+    timestamp_s: float,
+    model_seg,
+    model_pose,
+    appearance: RobustAppearanceModel,
+    mask_bias: Optional[VenueMaskBias] = None,
+    prev_bbox: Optional[tuple[float, float, float, float]] = None,
+    frame_progress: float = 0.5,
+    bbox_history: Optional[list[tuple[float, float, float, float]]] = None,
+) -> tuple[FrameAnalysis, Optional[tuple[float, float, float, float]], bool]:
+    """
+    Experimental refine_v2 frame pass.
+
+    Same appearance (+ optional mask) scoring as classic, plus:
+      - Soft temporal consistency vs prev_bbox (IoU boost; stronger when scores close)
+      - Mid-window (30–90%): aggressive online appearance updates (clothing lock)
+      - Early / landing: freeze online appearance (no contamination)
+      - Landing (≥90%): higher sand weight, lower sim floor, stronger temporal
+      - Pose-optional: missing keypoints still emit person_detected + bbox
+        (tracking_source refined_v2 / refined_v2_bbox_only)
+
+    Returns (FrameAnalysis, chosen_bbox_or_None, appearance_updated).
+    Classic path is unchanged. Gap fill runs separately after the full pass.
+    """
+    empty = FrameAnalysis(frame_idx=frame_idx, timestamp_s=timestamp_s)
+    empty.tracking_source = V2_TRACKING_SRC
+    zone = _v2_zone(frame_progress)
+    in_landing = zone == "landing"
+    in_mid = zone == "mid"
+
+    results = model_seg(image, classes=[0], conf=0.30, verbose=False)
+    if not results or results[0].boxes is None:
+        return empty, None, False
+
+    res    = results[0]
+    bboxes = res.boxes.xyxy.cpu().numpy()
+    confs  = res.boxes.conf.cpu().numpy()
+    areas  = [(b[2]-b[0])*(b[3]-b[1]) for b in bboxes]
+    valid  = [i for i, a in enumerate(areas) if a >= MIN_BBOX_AREA]
+    if not valid:
+        return empty, None, False
+
+    h, w = image.shape[:2]
+    det_masks = []
+    for i in range(len(bboxes)):
+        if res.masks is not None and i < len(res.masks.data):
+            mt = res.masks.data[i].cpu().numpy()
+            m  = cv2.resize(mt, (w, h), interpolation=cv2.INTER_NEAREST).astype(bool)
+            det_masks.append(m)
+        else:
+            det_masks.append(None)
+
+    if in_landing:
+        min_sim = (
+            V2_LANDING_MIN_SIM if mask_bias is not None
+            else V2_LANDING_MIN_SIM_NO_MASK
+        )
+        sand_w = V2_LANDING_SAND_WEIGHT
+    else:
+        min_sim = MIN_SIMILARITY_WITH_MASKS if mask_bias is not None else MIN_SIMILARITY
+        sand_w = SAND_OV_WEIGHT
+
+    # (i, sim, combined, track_ov, sand_ov, bbox)
+    scores = []
+    for i in valid:
+        bbox  = tuple(float(v) for v in bboxes[i])
+        sim   = appearance.similarity(image, mask=det_masks[i], bbox=tuple(int(v) for v in bbox))
+        track_ov = sand_ov = 0.0
+        if mask_bias is not None:
+            track_ov, sand_ov = mask_bias.overlaps(
+                frame_idx, bbox, det_masks[i], w, h,
+            )
+            combined = _blend_mask_score(sim, track_ov, sand_ov, sand_weight=sand_w)
+            if in_landing and sand_ov > 0.0:
+                combined += V2_LANDING_SAND_PREFER * sand_ov
+        else:
+            combined = sim
+        scores.append((i, sim, combined, track_ov, sand_ov, bbox))
+
+    eligible = [s for s in scores if s[1] >= min_sim]
+    if not eligible:
+        return empty, None, False
+
+    # Temporal soft blend: boost candidates overlapping previous chosen bbox(es).
+    # Landing: wider history + stronger weight (athlete close/blurred in sand).
+    history: list[tuple[float, float, float, float]] = []
+    if bbox_history:
+        history = list(bbox_history)
+    elif prev_bbox is not None:
+        history = [prev_bbox]
+
+    if history:
+        ranked = sorted(eligible, key=lambda x: x[2], reverse=True)
+        top_gap = (
+            ranked[0][2] - ranked[1][2] if len(ranked) >= 2 else 1.0
+        )
+        if in_landing:
+            temporal_w = V2_TEMPORAL_BOOST_LANDING
+            hist_refs = history[-V2_LANDING_TEMPORAL_HISTORY:]
+        else:
+            temporal_w = V2_TEMPORAL_IOU_WEIGHT
+            hist_refs = history[-1:]
+            if top_gap <= V2_TEMPORAL_CLOSE_GAP:
+                temporal_w = V2_TEMPORAL_IOU_WEIGHT * 2.0
+
+        def _final_score(s):
+            iou = max((_bbox_iou(s[5], ref) for ref in hist_refs), default=0.0)
+            return s[2] + temporal_w * iou
+
+        best_i, best_sim, _, best_track_ov, best_sand_ov, _ = max(
+            eligible, key=_final_score,
+        )
+    else:
+        best_i, best_sim, _, best_track_ov, best_sand_ov, _ = max(
+            eligible, key=lambda x: x[2],
+        )
+
+    x1, y1, x2, y2 = (int(v) for v in bboxes[best_i])
+    seg_mask  = det_masks[best_i]
+    mask_area = 0
+
+    if seg_mask is not None:
+        mask_area = int(seg_mask.sum())
+        ys, xs = np.where(seg_mask)
+        if len(xs) > 0:
+            x1, x2 = int(xs.min()), int(xs.max())
+            y1, y2 = int(ys.min()), int(ys.max())
+
+    chosen_bbox: tuple[float, float, float, float] = (
+        float(x1), float(y1), float(x2), float(y2),
+    )
+
+    # Online appearance update (before pose — identity lock does not need keypoints):
+    #   mid-window — aggressive (clothing lock)
+    #   early / landing — freeze (no contamination from start or sand close-ups)
+    appearance_updated = False
+    det_conf = float(confs[best_i])
+    if in_mid:
+        min_conf = V2_MID_ONLINE_MIN_CONF
+        min_sim_online = V2_MID_ONLINE_MIN_SIM
+        min_mask = V2_MID_ONLINE_MIN_MASK_AREA
+        min_track = V2_MID_ONLINE_MIN_TRACK_OV
+        venue_ok = True
+        if mask_bias is not None:
+            venue_ok = (
+                best_track_ov >= min_track
+                or best_sand_ov >= min_track
+            )
+        if (
+            det_conf >= min_conf
+            and mask_area > min_mask
+            and best_sim >= min_sim_online
+            and venue_ok
+        ):
+            appearance.add_positive(image, seg_mask, (x1, y1, x2, y2))
+            appearance_updated = True
+        for j, sim_j, _, _, _, _ in scores:
+            if j != best_i and best_sim > min_sim_online:
+                bj = tuple(int(v) for v in bboxes[j])
+                appearance.add_negative(image, det_masks[j], bj)
+    # early + landing: deliberately skip online updates
+
+    # Pose-optional: keep person_detected + bbox even when keypoints missing
+    fa = _v2_build_frame_analysis(
+        image, frame_idx, timestamp_s, model_pose,
+        (x1, y1, x2, y2), seg_mask, det_conf, float(best_sim),
+    )
+    return fa, chosen_bbox, appearance_updated
+
+
 # ─── Full second-pass pipeline ────────────────────────────────────────────────
 
 def run_reanalysis(
@@ -613,6 +1435,9 @@ def run_reanalysis(
     """
     Full second-pass pipeline.  Returns summary dict.
     Never touches the original output directory.
+
+    When config.refine_v2 is False, behavior matches the classic appearance-only
+    refine (same thresholds, online update, no temporal smoothing, no section pass).
     """
     out_dir       = Path(config.output_dir)
     out_frames    = out_dir / "frames"
@@ -630,11 +1455,23 @@ def run_reanalysis(
     on_progress({"stage": "loading_models", "message": f"Modelos listos ({time.time()-t0:.1f}s)", "percent": 8.0})
 
     # ── Optional venue masks from original calibration (not _refined) ─────────
+    # Mask policy:
+    #   classic: masks only when use_cnn_masks is True
+    #   refine_v2: if masks exist on original, use them for seed bias, temporal
+    #              consistency, AND selection blend (0.30/0.20) — even when
+    #              use_cnn_masks is False. use_cnn_masks alone still enables
+    #              masks on the classic path.
     mask_bias: Optional[VenueMaskBias] = None
     if config.use_cnn_masks:
         mask_bias = VenueMaskBias.from_output_dir(config.original_output_dir)
         if mask_bias is None:
             print("  [Reanalyzer] use_cnn_masks requested but masks unavailable — appearance-only")
+    elif config.refine_v2:
+        mask_bias = VenueMaskBias.from_output_dir(config.original_output_dir)
+        if mask_bias is None:
+            print("  [Reanalyzer v2] No venue masks on original — appearance + temporal only")
+        else:
+            print("  [Reanalyzer v2] Using existing venue masks (auto when present)")
     else:
         print("  [Reanalyzer] Venue masks OFF (appearance-only refine)")
 
@@ -647,6 +1484,7 @@ def run_reanalysis(
         seed_start_frame=config.seed_start_frame,
         seed_end_frame=config.seed_end_frame,
         mask_bias=mask_bias,
+        refine_v2=config.refine_v2,
     )
     if appearance is None or not appearance.is_ready:
         return {"error": "No se pudo sembrar el modelo de apariencia. Ejecuta el pipeline original primero."}
@@ -667,11 +1505,33 @@ def run_reanalysis(
         "percent":      22.0,
     })
 
+    # Precompute how many analysis frames this refine run will process
+    # (progress = index / (n-1) over this list — mid-window / landing zones).
+    analysis_frame_indices = list(range(start_f, end_f, config.stride))
+    n_analysis_planned = len(analysis_frame_indices)
+
     # ── Second pass ───────────────────────────────────────────────────────────
     analyses: list[FrameAnalysis] = []
     analysis_count  = 0
     annotated_count = 0
     frame_abs       = start_f
+    prev_bbox: Optional[tuple[float, float, float, float]] = None
+    bbox_history: list[tuple[float, float, float, float]] = []
+
+    # refine_v2 mid-window / landing stats
+    mid_lock_updates = 0
+    mid_lock_accepted = 0
+    mid_lock_logged = False
+    landing_mode_frames = 0
+    refs_at_mid_start = 0
+    entered_mid = False
+
+    if config.refine_v2:
+        print(
+            f"  [Reanalyzer v2] Mid-window lock {V2_MID_WINDOW[0]:.0%}–{V2_MID_WINDOW[1]:.0%}; "
+            f"landing tail ≥{V2_LANDING_TAIL:.0%} "
+            f"({n_analysis_planned} analysis frames planned)"
+        )
 
     cap = cv2.VideoCapture(config.video_path)
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_f)
@@ -685,15 +1545,65 @@ def run_reanalysis(
 
         if is_analysis_frame:
             ts = frame_abs / fps
-            fa = _analyze_frame_refined(
-                image=frame,
-                frame_idx=frame_abs,
-                timestamp_s=ts,
-                model_seg=model_seg,
-                model_pose=model_pose,
-                appearance=appearance,
-                mask_bias=mask_bias,
-            )
+            if config.refine_v2:
+                # Progress through refine analysis frames (not wall-clock)
+                if n_analysis_planned <= 1:
+                    frame_progress = 0.5
+                else:
+                    frame_progress = analysis_count / (n_analysis_planned - 1)
+                zone = _v2_zone(frame_progress)
+
+                fa, chosen_bbox, app_updated = _analyze_frame_refined_v2(
+                    image=frame,
+                    frame_idx=frame_abs,
+                    timestamp_s=ts,
+                    model_seg=model_seg,
+                    model_pose=model_pose,
+                    appearance=appearance,
+                    mask_bias=mask_bias,
+                    prev_bbox=prev_bbox,
+                    frame_progress=frame_progress,
+                    bbox_history=bbox_history,
+                )
+                if chosen_bbox is not None:
+                    prev_bbox = chosen_bbox
+                    bbox_history.append(chosen_bbox)
+                    if len(bbox_history) > V2_LANDING_TEMPORAL_HISTORY:
+                        bbox_history = bbox_history[-V2_LANDING_TEMPORAL_HISTORY:]
+
+                if zone == "mid":
+                    if not entered_mid:
+                        entered_mid = True
+                        refs_at_mid_start = len(appearance._pos_refs)
+                    if fa.person_detected:
+                        mid_lock_accepted += 1
+                    if app_updated:
+                        mid_lock_updates += 1
+                elif zone == "landing":
+                    landing_mode_frames += 1
+
+                # Once mid-window ends, freeze model and log lock stats once
+                if (
+                    not mid_lock_logged
+                    and frame_progress >= V2_LANDING_TAIL
+                ):
+                    mid_lock_logged = True
+                    n_refs = len(appearance._pos_refs)
+                    print(
+                        f"  [Reanalyzer v2] Mid-window clothing lock: "
+                        f"{mid_lock_accepted} accepted, {mid_lock_updates} appearance updates, "
+                        f"refs {refs_at_mid_start}→{n_refs} (frozen for landing)"
+                    )
+            else:
+                fa = _analyze_frame_refined(
+                    image=frame,
+                    frame_idx=frame_abs,
+                    timestamp_s=ts,
+                    model_seg=model_seg,
+                    model_pose=model_pose,
+                    appearance=appearance,
+                    mask_bias=mask_bias,
+                )
             analyses.append(fa)
             analysis_count += 1
 
@@ -726,15 +1636,59 @@ def run_reanalysis(
 
     cap.release()
 
+    if config.refine_v2:
+        if not mid_lock_logged:
+            n_refs = len(appearance._pos_refs)
+            print(
+                f"  [Reanalyzer v2] Mid-window clothing lock: "
+                f"{mid_lock_accepted} accepted, {mid_lock_updates} appearance updates, "
+                f"refs {refs_at_mid_start}→{n_refs}"
+            )
+        print(
+            f"  [Reanalyzer v2] Landing-mode frames: {landing_mode_frames} "
+            f"(sand_w={V2_LANDING_SAND_WEIGHT}, temporal={V2_TEMPORAL_BOOST_LANDING})"
+        )
+
+        # Post-pass: propagate mid identity into early/landing unknowns
+        on_progress({
+            "stage": "gap_fill",
+            "message": "Propagando identidad mid → early/landing…",
+            "percent": 90.0,
+        })
+        gap_stats = _v2_gap_fill_pass(
+            analyses=analyses,
+            frames_dir=out_frames,
+            model_seg=model_seg,
+            model_pose=model_pose,
+            appearance=appearance,
+            mask_bias=mask_bias,
+            annotate_every=config.annotate_every,
+            annotated_dir=out_annotated,
+        )
+        print(
+            f"  [Reanalyzer v2] Identity summary: "
+            f"bbox_only={gap_stats['bbox_only']} "
+            f"(tracking_source={V2_TRACKING_SRC_BBOX!r})"
+        )
+
     # ── Summary + JSON ────────────────────────────────────────────────────────
     on_progress({"stage": "writing_outputs", "message": "Escribiendo resultados refinados", "percent": 93.0})
 
     summary = _summarize_refined(analyses, analysis_count)
 
-    frames_data = [
-        frame_analysis_to_dict(a, extra={"tracking_source": "refined"})
-        for a in analyses
-    ]
+    if config.refine_v2:
+        frames_data = [
+            frame_analysis_to_dict(
+                a,
+                appearance_sim=float(getattr(a, "_appearance_sim", 0.0) or 0.0),
+            )
+            for a in analyses
+        ]
+    else:
+        frames_data = [
+            frame_analysis_to_dict(a, extra={"tracking_source": "refined"})
+            for a in analyses
+        ]
 
     result_data = build_analysis_document(
         video_path=config.video_path,
@@ -744,6 +1698,7 @@ def run_reanalysis(
             "start_sec":      config.start_sec,
             "end_sec":        config.end_sec,
             "use_cnn_masks":  bool(mask_bias is not None),
+            "refine_v2":      bool(config.refine_v2),
         },
         summary=summary,
         frames=frames_data,
@@ -756,6 +1711,28 @@ def run_reanalysis(
     json_path = out_dir / "analysis.json"
     with open(json_path, "w") as f:
         json.dump(result_data, f, indent=2)
+
+    # refine_v2 only: copy venue calibration/masks + run section analysis
+    if config.refine_v2:
+        on_progress({
+            "stage": "sections",
+            "message": "Copiando calibración y analizando secciones…",
+            "percent": 96.0,
+        })
+        try:
+            _copy_venue_assets_for_sections(
+                Path(config.original_output_dir), out_dir,
+            )
+        except Exception as exc:
+            print(f"  [Reanalyzer v2] Warning: could not copy venue assets: {exc}")
+
+        try:
+            from .section_analyzer import run_section_analysis
+            sections = run_section_analysis(out_dir, use_pose=True)
+            n_hops = len((sections.get("hops") or []))
+            print(f"  [Reanalyzer v2] Section analysis OK ({n_hops} hops)")
+        except Exception as exc:
+            print(f"  [Reanalyzer v2] Warning: section analysis failed (refine OK): {exc}")
 
     on_progress({
         "stage":           "done",

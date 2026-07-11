@@ -15,6 +15,11 @@ Endpoints:
   POST /api/sections/propagate/{video_name} → propagar hops desde ancla
   GET  /api/sections/pose-scores/{video_name}
   GET  /api/sections/{video_name}          → cargar sections.json
+  GET  /api/metrics/{video_name}           → cargar metrics.json
+  POST /api/metrics/{video_name}/compute   → recalcular métricas
+  POST /api/metrics/{video_name}/overrides → overrides de escala (hops_corridor_m)
+  POST /api/metrics/{video_name}/scale     → longitud corredor hops (m) + venue default
+  GET  /api/metrics/{video_name}/pose-overlay/{phase} → PNG superposición pose (hop/vuelo)
   GET  /api/venue/profile              → perfil de venue aprendido
   POST /api/venue/learn                → aprender colores de pista/arena + exportar dataset CNN
   POST /api/venue/train                → exportar dataset + entrenar CNN pista/arena
@@ -88,6 +93,8 @@ from src.section_analyzer import (
     unmark_phase_frame,
 )
 from src.phase_classifier import pose_classify_frames
+from src.metrics import apply_overrides, compute_metrics, load_metrics
+from src.pose_overlay import OVERLAY_PHASES, render_pose_overlay_png
 from src.venue_profile    import (
     DEFAULT_VENUE_ID,
     apply_masks_to_output,
@@ -305,6 +312,24 @@ class PhaseMovePayload(BaseModel):
 
 
 class PhasePropagatePayload(BaseModel):
+    athlete_id:      Optional[str] = None
+
+
+class MetricsOverridesPayload(BaseModel):
+    hops_corridor_m:   Optional[float] = None  # known m: 1st hop contact → landing (default 10)
+    hop_lengths_m:     Optional[list] = None   # legacy: up to 5 hop1–4 + final
+    total_length_m:    Optional[float] = None  # legacy alias of hops_corridor_m
+    known_distance_m:  Optional[float] = None
+    point_a:           Optional[list] = None   # [x,y] norm or px
+    point_b:           Optional[list] = None
+    m_per_px:          Optional[float] = None
+    notes:             Optional[str] = None
+    athlete_id:        Optional[str] = None
+    clear:             Optional[list] = None   # keys to remove from overrides
+
+
+class MetricsScalePayload(BaseModel):
+    hops_corridor_m: float
     athlete_id:      Optional[str] = None
 
 
@@ -669,6 +694,109 @@ def get_sections(video_name: str):
     return JSONResponse(data)
 
 
+@app.get("/api/metrics/{video_name}")
+def get_metrics(video_name: str):
+    out_dir = OUTPUT_ROOT / video_name
+    if not (out_dir / "analysis.json").exists():
+        raise HTTPException(404, f"No analysis for '{video_name}'.")
+    metrics_path = out_dir / "metrics.json"
+    if not metrics_path.exists():
+        return JSONResponse(load_metrics(out_dir))
+    with open(metrics_path, encoding="utf-8") as f:
+        return JSONResponse(json.load(f))
+
+
+@app.post("/api/metrics/{video_name}/compute")
+def compute_metrics_endpoint(video_name: str, athlete_id: Optional[str] = None):
+    """Recompute metrics from sections + analysis (+ calibration / overrides)."""
+    out_dir = OUTPUT_ROOT / video_name
+    if not (out_dir / "analysis.json").exists():
+        raise HTTPException(404, f"No analysis for '{video_name}'.")
+    if not (out_dir / "sections.json").exists():
+        raise HTTPException(404, f"No sections.json for '{video_name}'. Analyze sections first.")
+    try:
+        metrics = compute_metrics(out_dir, athlete_id=athlete_id)
+    except Exception as exc:
+        raise HTTPException(500, f"Metrics compute failed: {exc}") from exc
+    return JSONResponse({"ok": True, "video_name": video_name, "metrics": metrics})
+
+
+@app.post("/api/metrics/{video_name}/overrides")
+def metrics_overrides_endpoint(video_name: str, payload: MetricsOverridesPayload):
+    """Save scale overrides (prefer hops_corridor_m), recompute metrics."""
+    out_dir = OUTPUT_ROOT / video_name
+    if not (out_dir / "analysis.json").exists():
+        raise HTTPException(404, f"No analysis for '{video_name}'.")
+    data = payload.model_dump(exclude_none=True)
+    # Normalize legacy total_length_m → hops_corridor_m
+    if data.get("hops_corridor_m") is None and data.get("total_length_m") is not None:
+        data["hops_corridor_m"] = data["total_length_m"]
+    try:
+        metrics = apply_overrides(
+            out_dir,
+            data,
+            athlete_id=payload.athlete_id,
+        )
+    except Exception as exc:
+        raise HTTPException(500, f"Metrics overrides failed: {exc}") from exc
+    return JSONResponse({"ok": True, "video_name": video_name, "metrics": metrics})
+
+
+@app.post("/api/metrics/{video_name}/scale")
+def metrics_scale_endpoint(video_name: str, payload: MetricsScalePayload):
+    """Set hops corridor length (m) and recompute metrics. Persists as venue default."""
+    out_dir = OUTPUT_ROOT / video_name
+    if not (out_dir / "analysis.json").exists():
+        raise HTTPException(404, f"No analysis for '{video_name}'.")
+    if payload.hops_corridor_m <= 0:
+        raise HTTPException(400, "hops_corridor_m must be > 0.")
+    try:
+        metrics = apply_overrides(
+            out_dir,
+            {"hops_corridor_m": float(payload.hops_corridor_m)},
+            athlete_id=payload.athlete_id,
+        )
+    except Exception as exc:
+        raise HTTPException(500, f"Metrics scale failed: {exc}") from exc
+    return JSONResponse({"ok": True, "video_name": video_name, "metrics": metrics})
+
+
+@app.get("/api/metrics/{video_name}/pose-overlay/{phase}")
+def pose_overlay_endpoint(
+    video_name: str,
+    phase: str,
+    output_dir: Optional[str] = None,
+    force: bool = False,
+):
+    """
+    PNG overlay: reference (General) vs current take legs at hop contact / final flight.
+    phase: hop_1|hop_2|hop_3|hop_4|final_flight
+    Optional output_dir for refined analysis folders.
+    """
+    if phase not in OVERLAY_PHASES:
+        raise HTTPException(400, f"phase must be one of: {', '.join(OVERLAY_PHASES)}")
+    out_dir = Path(output_dir) if output_dir else OUTPUT_ROOT / video_name
+    if not (out_dir / "analysis.json").exists():
+        raise HTTPException(404, f"No analysis for '{video_name}' in {out_dir}.")
+    try:
+        png_bytes, meta = render_pose_overlay_png(
+            out_dir,
+            phase,
+            video_name=video_name,
+            use_cache=True,
+            force=force,
+        )
+    except Exception as exc:
+        raise HTTPException(500, f"Pose overlay failed: {exc}") from exc
+    from fastapi.responses import Response
+    headers = {}
+    if meta.get("source"):
+        headers["X-Pose-Overlay-Source"] = str(meta["source"])
+    if meta.get("frame_idx") is not None:
+        headers["X-Pose-Overlay-Frame"] = str(meta["frame_idx"])
+    return Response(content=png_bytes, media_type="image/png", headers=headers)
+
+
 @app.get("/api/venue/profile")
 def get_venue_profile(venue_id: str = DEFAULT_VENUE_ID):
     profile = load_profile(venue_id)
@@ -690,6 +818,7 @@ def get_venue_profile(venue_id: str = DEFAULT_VENUE_ID):
             or profile.get("track_hsv", {}).get("sample_count", 0)
         ),
         "learned_at": profile.get("learned_at"),
+        "hops_corridor_m": profile.get("hops_corridor_m", 10.0),
         "profile": profile,
     })
 
@@ -1063,15 +1192,20 @@ def _project_payload(video_path: str, output_dir: Optional[str] = None) -> dict:
     duration_s = _video_duration(video_file) if video_file.exists() else 0.0
     analysis_path = out_dir / "analysis.json"
     sections_path = out_dir / "sections.json"
+    metrics_path = out_dir / "metrics.json"
     chart_path = out_dir / "charts" / "camera_angle_timeline.png"
     analysis_data = None
     sections_data = None
+    metrics_data = None
     if analysis_path.exists():
         with open(analysis_path, encoding="utf-8") as f:
             analysis_data = json.load(f)
     if sections_path.exists():
         with open(sections_path, encoding="utf-8") as f:
             sections_data = json.load(f)
+    if metrics_path.exists():
+        with open(metrics_path, encoding="utf-8") as f:
+            metrics_data = json.load(f)
 
     frames = analysis_data.get("frames", []) if analysis_data else []
     if sections_data and frames:
@@ -1100,6 +1234,11 @@ def _project_payload(video_path: str, output_dir: Optional[str] = None) -> dict:
             "path": str(sections_path),
             "exists": sections_path.exists(),
             "data": sections_data,
+        },
+        "metrics": {
+            "path": str(metrics_path),
+            "exists": metrics_path.exists(),
+            "data": metrics_data,
         },
         "assets": {
             "annotated": _indexed_images(out_dir / "annotated", "annotated_"),
@@ -1296,6 +1435,7 @@ class ReanalyzeRequest(BaseModel):
     seed_start_frame:  Optional[int] = None   # frame_idx interval for seeding
     seed_end_frame:    Optional[int] = None
     use_cnn_masks:     bool  = False
+    refine_v2:         bool  = False          # experimental improved refine
 
 
 @app.post("/api/reanalyze")
@@ -1305,6 +1445,10 @@ def reanalyze_video(req: ReanalyzeRequest):
     frames, then re-runs seg+pose on the full video using appearance-only
     athlete selection (no ByteTrack).  Results go to output/<name>_refined/.
     Requires a completed first-pass analysis.json.
+
+    When refine_v2=True: temporal consistency, safer seeds, conservative
+    online updates, and post-refine section analysis. Classic path unchanged
+    when refine_v2=False.
     """
     if not Path(req.video_path).exists():
         raise HTTPException(404, f"Video not found: {req.video_path}")
@@ -1336,6 +1480,7 @@ def reanalyze_video(req: ReanalyzeRequest):
         seed_start_frame=req.seed_start_frame,
         seed_end_frame=req.seed_end_frame,
         use_cnn_masks=req.use_cnn_masks,
+        refine_v2=req.refine_v2,
     )
 
     def _run():

@@ -117,11 +117,22 @@ class SectionsJson(TypedDict, total=False):
 
 
 class MetricsJson(TypedDict, total=False):
-    """Derived hop lengths and partial metrics (Phase 4)."""
+    """Derived hop lengths, speeds, scale, consistency (Phase 4)."""
 
     schema_version: int
     derived_version: int
-    hop_lengths_m: list[Optional[float]]   # hop 1–4 + final jump
+    athlete_id: str
+    video_name: str
+    hop_lengths_m: list[Optional[float]]   # hop 1–4 + final jump (compat)
+    hop_lengths_px: list[Optional[float]]
+    total_hops_px: Optional[float]
+    total_hops_m: Optional[float]
+    segments: list[dict[str, Any]]
+    timing: dict[str, Any]
+    scale: dict[str, Any]
+    consistency: dict[str, Any]
+    comparison: dict[str, Any]
+    overrides: dict[str, Any]
     partial: dict[str, Any]
 
 
@@ -154,9 +165,28 @@ def empty_sections() -> SectionsJson:
 
 def empty_metrics() -> MetricsJson:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "derived_version": DERIVED_VERSION_INITIAL,
         "hop_lengths_m": [None, None, None, None, None],
+        "hop_lengths_px": [None, None, None, None, None],
+        "total_hops_px": None,
+        "total_hops_m": None,
+        "segments": [],
+        "timing": {
+            "contact_intervals_s": [],
+            "phase_durations_s": {},
+            "contact_timestamps_s": [],
+        },
+        "scale": {
+            "m_per_px": None,
+            "source": "none",
+            "notes": [],
+            "meters_estimated": True,
+            "hops_corridor_m": 10.0,
+        },
+        "consistency": {},
+        "comparison": {},
+        "overrides": {},
         "partial": {},
     }
 

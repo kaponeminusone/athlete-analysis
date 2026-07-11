@@ -503,29 +503,51 @@ def enhance_auto_contacts_with_pose(
     contact_frames: list[int],
     *,
     athlete_id: Optional[str] = None,
+    is_landing: Optional[list[bool]] = None,
 ) -> list[int]:
     """
-    Refine auto-detected contact frame indices using local pose hop_contact score.
+    Refine auto-detected contact frames (±3) maximizing hop_contact / landing
+    pose-tag similarity fused with biomechanical hop_contact_score.
     """
     if not contact_frames:
         return contact_frames
 
+    from .gt_contacts import score_pose_tag
+
     features_by_frame = extract_features_for_frames(frames)
     fmap = _frame_by_idx(frames)
     refined: list[int] = []
+    landing_flags = is_landing or [False] * len(contact_frames)
 
-    for fidx in contact_frames:
-        window = range(max(0, fidx - 4), fidx + 5)
-        best_f, best_s = fidx, 0.0
+    for i, fidx in enumerate(contact_frames):
+        want_landing = bool(landing_flags[i]) if i < len(landing_flags) else False
+        radius = 6 if want_landing else 3
+        window = range(max(0, fidx - radius), fidx + radius + 1)
+        best_f, best_s = fidx, -1.0
         for w in window:
             feat = features_by_frame.get(w)
-            if not feat:
+            if not feat or not feat.valid:
                 continue
-            s = feat.hop_contact_score + score_phase(feat, "hop_1", athlete_id=athlete_id) * 0.5
+            if want_landing:
+                tag_sim = score_pose_tag(feat.vector, "landing")
+                s = (
+                    0.45 * tag_sim
+                    + 0.30 * feat.landing_score
+                    + 0.25 * score_phase(feat, "landing", athlete_id=athlete_id)
+                )
+            else:
+                tag_sim = score_pose_tag(feat.vector, "hop_contact")
+                s = (
+                    0.50 * tag_sim
+                    + 0.30 * feat.hop_contact_score
+                    + 0.20 * score_phase(feat, "hop_1", athlete_id=athlete_id)
+                )
             if s > best_s:
                 best_s = s
                 best_f = w
         if best_f not in refined and fmap.get(best_f):
             refined.append(best_f)
+        elif fmap.get(fidx) and fidx not in refined:
+            refined.append(fidx)
 
     return sorted(refined)
