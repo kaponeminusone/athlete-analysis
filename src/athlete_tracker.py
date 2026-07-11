@@ -24,6 +24,8 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import Optional
 
+from .track_scorer import TrackScorerContext
+
 
 CALIBRATION_FRAMES   = 12    # frames to identify athlete by motion
 PADDING_RATIO        = 0.20  # bbox padding for pose crop
@@ -172,12 +174,16 @@ def _select_athlete(
     masks: list[Optional[np.ndarray]],   # per-detection full-frame mask or None
     image: np.ndarray,
     state: TrackState,
+    *,
+    frame_idx: int = 0,
+    track_scorer: Optional[TrackScorerContext] = None,
+    det_motion: Optional[dict[int, float]] = None,
 ) -> int:
     """
     Choose which detected person index is the athlete using:
       Priority 1 — exact ByteTrack ID match
       Priority 2 — appearance similarity (if model is ready)
-      Priority 3 — largest bounding box area (fallback)
+      Priority 3 — track scorer + largest bbox (fallback)
     Returns the index into the detection arrays.
     """
     # Priority 1: ByteTrack ID match
@@ -193,10 +199,15 @@ def _select_athlete(
             bbox = (int(bboxes[i][0]), int(bboxes[i][1]),
                     int(bboxes[i][2]), int(bboxes[i][3]))
             sim = state.appearance.similarity(image, mask=masks[i], bbox=bbox)
-            scores.append((i, sim))
+            track_bonus = 0.0
+            if track_scorer is not None:
+                motion = (det_motion or {}).get(int(track_ids[i]), 0.0)
+                track_bonus = track_scorer.candidate_selection_score(
+                    bbox, frame_idx, sim, motion_px=motion,
+                )
+            scores.append((i, sim + track_bonus * 0.15))
         best_i, best_sim = max(scores, key=lambda x: x[1])
         if best_sim >= (1.0 - APPEARANCE_THRESHOLD):
-            # update track ID to newly matched detection
             new_tid = int(track_ids[best_i])
             if new_tid != state.athlete_track_id:
                 print(f"  [Appearance] Re-ID: {state.athlete_track_id} → {new_tid} "
@@ -204,7 +215,22 @@ def _select_athlete(
                 state.athlete_track_id = new_tid
             return best_i
 
-    # Priority 3: largest bbox
+    # Priority 3: track scorer or largest bbox
+    if track_scorer is not None:
+        ranked = []
+        for i in valid:
+            bbox = (float(bboxes[i][0]), float(bboxes[i][1]),
+                    float(bboxes[i][2]), float(bboxes[i][3]))
+            motion = (det_motion or {}).get(int(track_ids[i]), 0.0)
+            sim = state.appearance.similarity(image, mask=masks[i], bbox=(
+                int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]),
+            ))
+            ts = track_scorer.candidate_selection_score(
+                bbox, frame_idx, sim, motion_px=motion,
+            )
+            ranked.append((i, ts + areas[i] * 1e-6))
+        return max(ranked, key=lambda x: x[1])[0]
+
     return max(valid, key=lambda i: areas[i])
 
 
@@ -214,6 +240,7 @@ def run_tracked_frame(
     state: TrackState,
     frame_idx: int,
     model_pose=None,   # None = tracking only (no pose estimation)
+    track_scorer: Optional[TrackScorerContext] = None,
 ) -> dict:
     """
     Seg+track → appearance selection → (optional) pose on crop.
@@ -232,6 +259,8 @@ def run_tracked_frame(
         "kps_xy": None, "kps_conf": None,
         "seg_mask": None, "quality_score": 0.0,
         "appearance_sim": 0.0,
+        "track_overlap": None, "athlete_state": None,
+        "position_s": None, "predicted_bbox": None,
     }
 
     # ── Seg + ByteTrack ───────────────────────────────────────────────────────
@@ -256,6 +285,9 @@ def run_tracked_frame(
     areas    = [(b[2]-b[0])*(b[3]-b[1]) for b in bboxes]
     valid    = [i for i, a in enumerate(areas) if a >= MIN_BBOX_AREA]
     if not valid:
+        if track_scorer is not None:
+            lost = track_scorer.score_bbox(None, frame_idx)
+            empty.update(lost)
         return empty
 
     # ── Build per-detection masks (full frame) ────────────────────────────────
@@ -279,9 +311,17 @@ def run_tracked_frame(
     ]
     state.update_calibration(detections_for_cal)
 
+    det_motion = {
+        int(track_ids[i]): float(state._displacement.get(int(track_ids[i]), 0.0))
+        for i in valid
+    }
+
     # ── Select athlete ────────────────────────────────────────────────────────
     athlete_idx = _select_athlete(
-        valid, track_ids, bboxes, areas, det_masks, image, state
+        valid, track_ids, bboxes, areas, det_masks, image, state,
+        frame_idx=frame_idx,
+        track_scorer=track_scorer,
+        det_motion=det_motion,
     )
 
     bbox = bboxes[athlete_idx]
@@ -339,6 +379,12 @@ def run_tracked_frame(
                                + 0.15 * min(1.0, mask_area / 30000.0)
                                + 0.10 * app_sim)
 
+    track_fields: dict = {}
+    if track_scorer is not None:
+        track_fields = track_scorer.score_bbox(
+            (float(x1), float(y1), float(x2), float(y2)), frame_idx,
+        )
+
     return {
         "found":          True,
         "track_id":       tid,
@@ -350,4 +396,5 @@ def run_tracked_frame(
         "seg_mask":       seg_mask,
         "quality_score":  round(float(quality), 3),
         "appearance_sim": round(float(app_sim), 3),
+        **track_fields,
     }

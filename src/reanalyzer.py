@@ -47,6 +47,11 @@ from .pose_analyzer import (
     analyze_frame_from_tracker,
 )
 from .visualizer import annotate_frame
+from .schemas import (
+    build_analysis_document,
+    frame_analysis_to_dict,
+    write_derived_stubs,
+)
 
 SEED_MIN_QUALITY = 0.65
 SEED_MAX_FRAMES  = 15
@@ -606,35 +611,27 @@ def run_reanalysis(
     on_progress({"stage": "writing_outputs", "message": "Escribiendo resultados refinados", "percent": 93.0})
 
     summary = _summarize_refined(analyses, analysis_count)
-    result_data = {
-        "video":      config.video_path,
-        "video_info": info,
-        "pass":       "refined",
-        "config": {
+
+    frames_data = [
+        frame_analysis_to_dict(a, extra={"tracking_source": "refined"})
+        for a in analyses
+    ]
+
+    result_data = build_analysis_document(
+        video_path=config.video_path,
+        video_info=info,
+        config={
             "stride":    config.stride,
             "start_sec": config.start_sec,
             "end_sec":   config.end_sec,
         },
-        "summary": summary,
-        "frames": [
-            {
-                "frame_idx":           a.frame_idx,
-                "timestamp_s":         round(a.timestamp_s, 3),
-                "person_detected":     a.person_detected,
-                "track_id":            a.track_id,
-                "camera_angle":        a.camera_angle.value,
-                "shoulder_ratio":      round(a.shoulder_ratio, 4),
-                "angle_confidence":    round(a.angle_confidence, 4),
-                "keypoints_valid":     a.keypoints_valid_count,
-                "quality_score":       a.quality_score,
-                "usable_for_analysis": a.usable_for_analysis,
-                "has_mask":            a.has_mask,
-                "mask_area_px":        a.mask_area_px,
-                "tracking_source":     "refined",
-            }
-            for a in analyses
-        ],
-    }
+        summary=summary,
+        frames=frames_data,
+        output_dir=out_dir,
+        analysis_pass="refined",
+    )
+
+    write_derived_stubs(out_dir)
 
     json_path = out_dir / "analysis.json"
     with open(json_path, "w") as f:

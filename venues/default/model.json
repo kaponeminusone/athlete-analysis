@@ -1,0 +1,21 @@
+{
+  "weights": "venues/default/runs/seg/weights/best.pt",
+  "classes": [
+    "track",
+    "sand"
+  ],
+  "trained_at": "2026-07-11T12:10:13.749749+00:00",
+  "epochs": 40,
+  "imgsz": 640,
+  "base_model": "yolo11n-seg.pt",
+  "metrics": {
+    "metrics/precision(B)": 0.9963251950122424,
+    "metrics/recall(B)": 1.0,
+    "metrics/mAP50(B)": 0.995,
+    "metrics/mAP50-95(B)": 0.7470823023259363,
+    "metrics/precision(M)": 0.9963251950122424,
+    "metrics/recall(M)": 1.0,
+    "metrics/mAP50(M)": 0.995,
+    "metrics/mAP50-95(M)": 0.6898553637029446
+  }
+}

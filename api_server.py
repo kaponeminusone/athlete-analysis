@@ -4,6 +4,24 @@ API Server — bridge entre la UI y el pipeline de analisis.
 Endpoints:
   GET  /status                       → estado del servidor y modelos cargados
   GET  /analysis/{video_name}        → cargar analysis.json existente
+  GET  /api/calibration/{video_name} → cargar calibration.json
+  POST /api/calibration/{video_name} → guardar calibration.json
+  POST /api/calibration/{video_name}/seeds → guardar semillas de pista
+  POST /api/calibration/{video_name}/propagate → propagar calibracion (optical flow)
+  POST /api/recompute-tracking/{video_name} → recalcular campos track sin YOLO
+  POST /api/sections/analyze/{video_name}   → detectar fases (pose + tobillos)
+  POST /api/sections/mark/{video_name}      → marcar fase en frame
+  DELETE /api/sections/mark/{video_name}/{frame_idx}
+  POST /api/sections/propagate/{video_name} → propagar hops desde ancla
+  GET  /api/sections/pose-scores/{video_name}
+  GET  /api/sections/{video_name}          → cargar sections.json
+  GET  /api/venue/profile              → perfil de venue aprendido
+  POST /api/venue/learn                → aprender colores de pista/arena + exportar dataset CNN
+  POST /api/venue/train                → exportar dataset + entrenar CNN pista/arena
+  GET  /api/venue/model                → estado del modelo CNN de venue
+  GET  /api/venue/dataset              → manifiesto del dataset CNN multi-video
+  POST /api/venue/apply/{video_name}   → auto-calibrar con perfil + recomputar
+  POST /api/venue/correct/{video_name} → correccion manual de mascaras pista/arena
   POST /analyze                      → correr el pipeline completo en un video
   POST /correct                      → aplicar correccion manual a un frame
   GET  /frame/{video_name}/{frame}   → imagen del frame crudo o anotado
@@ -49,8 +67,43 @@ from src.visualizer       import annotate_frame
 from src.pipeline         import PipelineConfig, run_pipeline
 from src.job_store        import create_job, get_job, list_jobs
 from src.reanalyzer       import ReanalysisConfig, run_reanalysis
+from src.schemas          import frame_analysis_to_dict, frame_record_to_analysis
+from src.calibration      import (
+    default_calibration,
+    has_seeds,
+    keyframes_incomplete,
+    load_calibration,
+    normalize_calibration,
+    run_propagation_for_output,
+    save_calibration,
+)
+from src.calibration_propagator import target_frames_from_analysis
+from src.track_scorer     import recompute_frames_track_fields
+from src.section_analyzer import (
+    mark_phase_on_frame,
+    move_phase_marker_on_frame,
+    phase_at_frame,
+    run_phase_propagation,
+    run_section_analysis,
+    unmark_phase_frame,
+)
+from src.phase_classifier import pose_classify_frames
+from src.venue_profile    import (
+    DEFAULT_VENUE_ID,
+    apply_masks_to_output,
+    apply_profile_to_output,
+    learn_from_calibration,
+    learn_from_selections,
+    load_profile,
+    save_debug_frames,
+    segment_frame_masks,
+    selections_from_calibration,
+)
+from src.venue_masks import should_use_keyframe_pipeline
+from src.venue_seg_infer import has_trained_seg_model, load_model_meta
 
 OUTPUT_ROOT = Path("output")
+VENUE_ROOT = Path("venues")
 app = FastAPI(title="Triple Jump Analyzer API")
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 
@@ -93,27 +146,63 @@ def _video_duration(path: Path) -> float:
     return round(float(total / fps), 3) if fps else 0.0
 
 
-def _load_analysis(video_name: str) -> Optional[list[dict]]:
-    path = OUTPUT_ROOT / video_name / "analysis.json"
+def _resolve_output_dir(video_path: str, output_dir: Optional[str] = None) -> Path:
+    if output_dir:
+        return Path(output_dir)
+    return _output_dir(video_path)
+
+
+def _load_analysis_dir(out_dir: Path) -> Optional[dict]:
+    path = out_dir / "analysis.json"
     if not path.exists():
         return None
-    with open(path) as f:
-        data = json.load(f)
-    return data
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
 
 
-def _save_analysis(video_name: str, frames_data: list[dict], extra: dict = {}):
-    out = OUTPUT_ROOT / video_name
-    out.mkdir(parents=True, exist_ok=True)
-    path = out / "analysis.json"
-    existing = {}
+def _load_analysis(video_name: str) -> Optional[dict]:
+    return _load_analysis_dir(OUTPUT_ROOT / video_name)
+
+
+def _save_analysis_dir(out_dir: Path, frames_data: list[dict], extra: Optional[dict] = None) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / "analysis.json"
+    existing: dict = {}
     if path.exists():
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             existing = json.load(f)
     existing["frames"] = frames_data
-    existing.update(extra)
-    with open(path, "w") as f:
+    if extra:
+        existing.update(extra)
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(existing, f, indent=2)
+
+
+def _save_analysis(video_name: str, frames_data: list[dict], extra: Optional[dict] = None) -> None:
+    _save_analysis_dir(OUTPUT_ROOT / video_name, frames_data, extra=extra)
+
+
+def _merge_frame_correction(existing: dict, update: dict) -> dict:
+    """Merge corrected pose into analysis.json without wiping track fields."""
+    merged = {**existing, **update}
+    for key in ("track_overlap", "athlete_state", "position_s", "predicted_bbox"):
+        if update.get(key) is None and existing.get(key) is not None:
+            merged[key] = existing[key]
+    merged.pop("annotated_image", None)
+    return merged
+
+
+def _append_correction_log(out_dir: Path, record: dict) -> None:
+    path = out_dir / "corrections.json"
+    data: dict = {"schema_version": 1, "corrections": []}
+    if path.exists():
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    corrections = list(data.get("corrections") or [])
+    corrections.append(record)
+    data["corrections"] = corrections
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
 
 
 # ─── Request / Response models ────────────────────────────────────────────────
@@ -134,12 +223,89 @@ class CorrectionRequest(BaseModel):
     propagation_radius:  int   = 15
     propagation_end_frame: Optional[int] = None  # specific end frame for forward pass
     sot_backend:         str   = "none"         # "none" | "csrt" | "sam2"
+    output_dir:          Optional[str] = None
 
 
 class CorrectionResponse(BaseModel):
     corrected_frame:  dict
     updated_frames:   list[dict]
     total_affected:   int
+    pose_warning:     Optional[str] = None
+
+
+class CalibrationPayload(BaseModel):
+    version:   int = 2
+    video:     str
+    keyframes: list = []
+    mode:      Optional[str] = None
+    seeds:     Optional[list] = None
+    propagation: Optional[dict] = None
+
+
+class SeedsPayload(BaseModel):
+    seeds:       list
+    video_path:  Optional[str] = None
+    mode:        str = "seed_auto"
+
+
+class PropagatePayload(BaseModel):
+    video_path:    Optional[str] = None
+    snap_to_lines: bool = False
+    from_frame:    Optional[int] = None
+
+
+class VenueLearnPayload(BaseModel):
+    video_name:  str
+    video_path:  Optional[str] = None
+    venue_id:    str = DEFAULT_VENUE_ID
+    accumulate:  bool = True
+    samples:     Optional[list] = None
+
+
+class VenueApplyPayload(BaseModel):
+    video_path:  Optional[str] = None
+    venue_id:    str = DEFAULT_VENUE_ID
+    merge:       bool = True
+    prefer_propagation: bool = True
+    use_masks:   bool = True
+    prefer_keyframes: bool = True
+
+
+class VenueTrainPayload(BaseModel):
+    video_name:  Optional[str] = None
+    venue_id:    str = DEFAULT_VENUE_ID
+    video_path:  Optional[str] = None
+    epochs:      int = 40
+    imgsz:       int = 640
+    model:       str = "yolo11n-seg.pt"
+
+
+class VenueCorrectPayload(BaseModel):
+    frame_idx:       int
+    layer:           str = "track"          # track | sand
+    mask_grid:       Optional[list] = None
+    full_mask:       Optional[list] = None
+    operation:       str = "add"            # add | remove
+    radius:          int = 15
+    direction:       str = "both"           # both | forward | backward
+    video_path:      Optional[str] = None
+
+
+class PhaseMarkPayload(BaseModel):
+    frame_idx:       int
+    phase:           str
+    pose_tag:        Optional[str] = None   # hop_contact | hop_flight | final_takeoff | feet_together
+    athlete_id:      Optional[str] = None
+    update_template: bool = True
+
+
+class PhaseMovePayload(BaseModel):
+    from_frame_idx:  int
+    to_frame_idx:    int
+
+
+class PhasePropagatePayload(BaseModel):
+    athlete_id:      Optional[str] = None
 
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────
@@ -160,6 +326,715 @@ def get_analysis(video_name: str):
     if data is None:
         raise HTTPException(404, f"No analysis found for '{video_name}'. Run /analyze first.")
     return JSONResponse(data)
+
+
+@app.get("/api/calibration/{video_name}")
+def get_calibration(video_name: str):
+    out_dir = OUTPUT_ROOT / video_name
+    data = load_calibration(out_dir)
+    if data is None:
+        return JSONResponse(default_calibration(video_name))
+    return JSONResponse(data)
+
+
+@app.post("/api/calibration/{video_name}")
+def post_calibration(video_name: str, payload: CalibrationPayload):
+    out_dir = OUTPUT_ROOT / video_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    data = normalize_calibration(payload.model_dump(exclude_none=True))
+    if not data.get("video"):
+        data["video"] = f"{video_name}.mp4"
+    save_calibration(out_dir, data)
+    return JSONResponse({"ok": True, "calibration": data})
+
+
+def _resolve_video_path(video_name: str, out_dir: Path,
+                        video_path: Optional[str] = None) -> Path:
+    if video_path:
+        p = Path(video_path)
+        if p.exists():
+            return p
+    cal = load_calibration(out_dir)
+    if cal and cal.get("video"):
+        for candidate in (
+            Path(cal["video"]),
+            Path(video_name).parent / cal["video"],
+            Path(video_name) / cal["video"],
+            Path(".") / Path(cal["video"]).name,
+            Path(".") / cal["video"],
+        ):
+            if candidate.exists():
+                return candidate
+    for candidate in (
+        Path(f"{video_name}.mp4"),
+        Path(f"{video_name}.mov"),
+        Path(".") / f"{video_name}.mp4",
+    ):
+        if candidate.exists():
+            return candidate
+    raise HTTPException(404, f"Video file not found for '{video_name}'. Pass video_path.")
+
+
+def _recompute_tracking_if_analysis(out_dir: Path, video_name: str) -> int:
+    analysis_path = out_dir / "analysis.json"
+    if not analysis_path.exists():
+        return 0
+    with open(analysis_path, encoding="utf-8") as f:
+        data = json.load(f)
+    frames = data.get("frames", [])
+    if not frames:
+        return 0
+    vi = data.get("video_info", {})
+    width = int(vi.get("width", 1280))
+    height = int(vi.get("height", 720))
+    updated_frames, count = recompute_frames_track_fields(
+        frames, out_dir, width=width, height=height,
+    )
+    data["frames"] = updated_frames
+    with open(analysis_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    return count
+
+
+def _maybe_auto_propagate_calibration(video_name: str, video_path: str) -> None:
+    out_dir = OUTPUT_ROOT / video_name
+    cal = load_calibration(out_dir)
+    targets = target_frames_from_analysis(out_dir)
+
+    try:
+        if cal is not None and has_seeds(cal):
+            if targets and keyframes_incomplete(cal, targets):
+                print(f"[API] Auto-propagating calibration for {video_name}...")
+                run_propagation_for_output(out_dir, Path(video_path))
+        elif cal is not None and cal.get("keyframes"):
+            pass  # manual keyframes already present
+
+        cal_after = load_calibration(out_dir)
+        if cal_after and cal_after.get("keyframes"):
+            count = _recompute_tracking_if_analysis(out_dir, video_name)
+            print(f"[API] Auto calibration done · tracking updated on {count} frames")
+    except Exception as exc:
+        print(f"[API] Auto calibration failed for {video_name}: {exc}")
+
+
+@app.post("/api/calibration/{video_name}/seeds")
+def post_calibration_seeds(video_name: str, payload: SeedsPayload):
+    out_dir = OUTPUT_ROOT / video_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cal = load_calibration(out_dir) or default_calibration(video_name)
+    cal["version"] = max(int(cal.get("version", 1)), 2)
+    cal["mode"] = payload.mode
+    cal["seeds"] = payload.seeds
+    if payload.video_path:
+        cal["video"] = Path(payload.video_path).name
+    elif not cal.get("video"):
+        cal["video"] = f"{video_name}.mp4"
+    data = normalize_calibration(cal)
+    save_calibration(out_dir, data)
+    return JSONResponse({"ok": True, "calibration": data})
+
+
+@app.post("/api/calibration/{video_name}/propagate")
+def post_calibration_propagate(video_name: str, payload: PropagatePayload):
+    out_dir = OUTPUT_ROOT / video_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cal = load_calibration(out_dir)
+    if cal is None or not has_seeds(cal):
+        raise HTTPException(
+            400,
+            f"No seeds for '{video_name}'. POST /api/calibration/{video_name}/seeds first.",
+        )
+
+    video_file = _resolve_video_path(video_name, out_dir, payload.video_path)
+
+    try:
+        data = run_propagation_for_output(
+            out_dir,
+            video_file,
+            snap_to_lines=payload.snap_to_lines,
+            from_frame=payload.from_frame,
+        )
+    except Exception as exc:
+        raise HTTPException(500, f"Propagation failed: {exc}") from exc
+
+    frames_updated = _recompute_tracking_if_analysis(out_dir, video_name)
+
+    return JSONResponse({
+        "ok": True,
+        "calibration": data,
+        "frames_propagated": data.get("propagation", {}).get("frame_count", 0),
+        "tracking_frames_updated": frames_updated,
+    })
+
+
+@app.post("/api/recompute-tracking/{video_name}")
+def recompute_tracking(video_name: str):
+    """
+    Recompute track_overlap / athlete_state / position_s / predicted_bbox
+    on existing analysis.json using calibration.json (no YOLO re-run).
+    """
+    out_dir = OUTPUT_ROOT / video_name
+    analysis_path = out_dir / "analysis.json"
+    if not analysis_path.exists():
+        raise HTTPException(
+            404,
+            f"No analysis found for '{video_name}'. Run /analyze first.",
+        )
+    cal = load_calibration(out_dir)
+    if cal is None:
+        raise HTTPException(
+            400,
+            f"No calibration for '{video_name}'. Apply venue masks in Pista mode first.",
+        )
+    mask_mode = cal.get("mode") == "color_masks" and bool(cal.get("mask_frames"))
+    if not mask_mode and not cal.get("keyframes"):
+        raise HTTPException(
+            400,
+            f"No track calibration for '{video_name}'. "
+            "Apply venue profile in Pista mode first.",
+        )
+
+    with open(analysis_path, encoding="utf-8") as f:
+        data = json.load(f)
+    frames = data.get("frames", [])
+    if not frames:
+        raise HTTPException(400, "analysis.json has no frames.")
+
+    vi = data.get("video_info", {})
+    width = int(vi.get("width", 1280))
+    height = int(vi.get("height", 720))
+
+    updated_frames, count = recompute_frames_track_fields(
+        frames, out_dir, width=width, height=height,
+    )
+    data["frames"] = updated_frames
+    with open(analysis_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+    return JSONResponse({
+        "ok": True,
+        "video_name": video_name,
+        "frames_updated": count,
+    })
+
+
+@app.post("/api/sections/analyze/{video_name}")
+def analyze_sections_endpoint(video_name: str, use_pose: bool = True):
+    """Detect approach/hops/landing from ankles + pose; write sections.json."""
+    out_dir = OUTPUT_ROOT / video_name
+    analysis_path = out_dir / "analysis.json"
+    if not analysis_path.exists():
+        raise HTTPException(
+            404,
+            f"No analysis found for '{video_name}'. Run /analyze first.",
+        )
+
+    try:
+        sections = run_section_analysis(out_dir, use_pose=use_pose)
+    except Exception as exc:
+        raise HTTPException(500, f"Section analysis failed: {exc}") from exc
+
+    return JSONResponse({
+        "ok": True,
+        "video_name": video_name,
+        "sections": sections,
+        "contacts_found": len(sections.get("contacts", [])),
+        "markers_count": len(sections.get("phase_markers", [])),
+        "confidence": sections.get("confidence", 0),
+        "derived_version": sections.get("derived_version", 0),
+    })
+
+
+@app.post("/api/sections/mark/{video_name}")
+def mark_phase_endpoint(video_name: str, payload: PhaseMarkPayload):
+    """Assign phase/pose to a frame on the timeline."""
+    out_dir = OUTPUT_ROOT / video_name
+    if not (out_dir / "analysis.json").exists():
+        raise HTTPException(404, f"No analysis for '{video_name}'.")
+
+    try:
+        sections = mark_phase_on_frame(
+            out_dir,
+            payload.frame_idx,
+            payload.phase,
+            pose_tag=payload.pose_tag,
+            athlete_id=payload.athlete_id,
+            update_template=payload.update_template,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(500, f"Phase mark failed: {exc}") from exc
+
+    return JSONResponse({
+        "ok": True,
+        "video_name": video_name,
+        "sections": sections,
+        "markers_count": len(sections.get("phase_markers", [])),
+        "contacts_found": len(sections.get("contacts", [])),
+    })
+
+
+@app.post("/api/sections/mark/{video_name}/move")
+def move_phase_marker_endpoint(video_name: str, payload: PhaseMovePayload):
+    """Drag a phase marker to another frame (swaps if destination occupied)."""
+    out_dir = OUTPUT_ROOT / video_name
+    if not (out_dir / "analysis.json").exists():
+        raise HTTPException(404, f"No analysis for '{video_name}'.")
+
+    try:
+        sections = move_phase_marker_on_frame(
+            out_dir, payload.from_frame_idx, payload.to_frame_idx,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(500, f"Phase move failed: {exc}") from exc
+
+    return JSONResponse({
+        "ok": True,
+        "video_name": video_name,
+        "sections": sections,
+        "markers_count": len(sections.get("phase_markers", [])),
+        "contacts_found": len(sections.get("contacts", [])),
+    })
+
+
+@app.delete("/api/sections/mark/{video_name}/{frame_idx}")
+def unmark_phase_endpoint(video_name: str, frame_idx: int):
+    out_dir = OUTPUT_ROOT / video_name
+    if not (out_dir / "analysis.json").exists():
+        raise HTTPException(404, f"No analysis for '{video_name}'.")
+
+    try:
+        sections = unmark_phase_frame(out_dir, frame_idx)
+    except Exception as exc:
+        raise HTTPException(500, f"Phase unmark failed: {exc}") from exc
+
+    return JSONResponse({
+        "ok": True,
+        "video_name": video_name,
+        "sections": sections,
+    })
+
+
+@app.post("/api/sections/propagate/{video_name}")
+def propagate_phases_endpoint(video_name: str, payload: PhasePropagatePayload = PhasePropagatePayload()):
+    """Backward-propagate hop markers from final_jump/landing anchor."""
+    out_dir = OUTPUT_ROOT / video_name
+    if not (out_dir / "analysis.json").exists():
+        raise HTTPException(404, f"No analysis for '{video_name}'.")
+
+    try:
+        sections = run_phase_propagation(out_dir)
+        if payload.athlete_id:
+            sections["athlete_id"] = payload.athlete_id
+            from src.section_analyzer import write_sections
+            write_sections(out_dir, sections)
+    except Exception as exc:
+        raise HTTPException(500, f"Phase propagation failed: {exc}") from exc
+
+    return JSONResponse({
+        "ok": True,
+        "video_name": video_name,
+        "sections": sections,
+        "markers_count": len(sections.get("phase_markers", [])),
+        "contacts_found": len(sections.get("contacts", [])),
+    })
+
+
+@app.get("/api/sections/pose-scores/{video_name}")
+def pose_scores_endpoint(video_name: str, athlete_id: Optional[str] = None):
+    """Per-frame pose phase scores (debug / preview)."""
+    out_dir = OUTPUT_ROOT / video_name
+    analysis_path = out_dir / "analysis.json"
+    if not analysis_path.exists():
+        raise HTTPException(404, f"No analysis for '{video_name}'.")
+
+    with open(analysis_path, encoding="utf-8") as f:
+        data = json.load(f)
+    frames = data.get("frames") or []
+    scores = pose_classify_frames(frames, athlete_id=athlete_id)
+    return JSONResponse({"ok": True, "scores": scores})
+
+
+@app.get("/api/sections/{video_name}")
+def get_sections(video_name: str):
+    out_dir = OUTPUT_ROOT / video_name
+    sections_path = out_dir / "sections.json"
+    if not sections_path.exists():
+        raise HTTPException(404, f"No sections.json for '{video_name}'.")
+    with open(sections_path, encoding="utf-8") as f:
+        data = json.load(f)
+    return JSONResponse(data)
+
+
+@app.get("/api/venue/profile")
+def get_venue_profile(venue_id: str = DEFAULT_VENUE_ID):
+    profile = load_profile(venue_id)
+    if profile is None:
+        return JSONResponse({
+            "learned": False,
+            "venue_id": venue_id,
+            "profile": None,
+        })
+    return JSONResponse({
+        "learned": True,
+        "venue_id": venue_id,
+        "frames_used": profile.get("frames_used", 0),
+        "sand_frames_used": profile.get("sand_frames_used", 0),
+        "source_video": profile.get("source_video"),
+        "videos_contributed": profile.get("videos_contributed", []),
+        "sample_count": (
+            profile.get("track_color", {}).get("sample_count")
+            or profile.get("track_hsv", {}).get("sample_count", 0)
+        ),
+        "learned_at": profile.get("learned_at"),
+        "profile": profile,
+    })
+
+
+@app.post("/api/venue/learn")
+def post_venue_learn(payload: VenueLearnPayload):
+    video_name = payload.video_name
+    out_dir = OUTPUT_ROOT / video_name
+    cal_path = out_dir / "calibration.json"
+    if not payload.samples and not cal_path.exists():
+        raise HTTPException(
+            400,
+            f"No calibration.json for '{video_name}'. Paint brush samples or calibrate first.",
+        )
+    video_file = _resolve_video_path(video_name, out_dir, payload.video_path)
+    try:
+        if payload.samples:
+            with open(cal_path, encoding="utf-8") as f:
+                cal = json.load(f)
+            cal_selections = selections_from_calibration(cal)
+            by_frame = {int(s["frame_idx"]): s for s in cal_selections}
+            for sample in payload.samples:
+                fidx = int(sample["frame_idx"])
+                if fidx in by_frame:
+                    by_frame[fidx] = {**by_frame[fidx], **sample}
+                else:
+                    by_frame[fidx] = sample
+            selections = list(by_frame.values())
+            profile = learn_from_selections(
+                video_file,
+                selections,
+                accumulate=payload.accumulate,
+                venue_id=payload.venue_id,
+            )
+        else:
+            with open(cal_path, encoding="utf-8") as f:
+                cal = json.load(f)
+            profile = learn_from_calibration(
+                video_file,
+                cal,
+                venue_id=payload.venue_id,
+                accumulate=payload.accumulate,
+            )
+    except Exception as exc:
+        raise HTTPException(500, f"Venue learn failed: {exc}") from exc
+
+    dataset_result: dict = {}
+    try:
+        from scripts.train_venue_seg import export_dataset_append, get_dataset_info
+        from src.venue_masks import polygon_keyframes
+
+        with open(cal_path, encoding="utf-8") as f:
+            cal_for_export = json.load(f)
+        if polygon_keyframes(cal_for_export):
+            dataset_result = export_dataset_append(
+                video_name,
+                cal_path,
+                video_path=video_file,
+                venue_id=payload.venue_id,
+            )
+        else:
+            info = get_dataset_info(payload.venue_id)
+            dataset_result = {
+                "frames_exported": 0,
+                "videos_in_dataset": info["video_count"],
+                "total_dataset_frames": info["total_frames"],
+                "dataset_manifest": info["manifest"],
+            }
+    except Exception as exc:
+        raise HTTPException(500, f"Venue learn ok but dataset export failed: {exc}") from exc
+
+    manifest = dataset_result.get("dataset_manifest", {})
+    return JSONResponse({
+        "ok": True,
+        "venue_id": payload.venue_id,
+        "frames_used": profile.get("frames_used", 0),
+        "sand_frames_used": profile.get("sand_frames_used", 0),
+        "videos_contributed": profile.get("videos_contributed", []),
+        "sample_count": profile.get("track_color", {}).get("sample_count", 0),
+        "profile_path": str(VENUE_ROOT / payload.venue_id / "profile.json"),
+        "frames_exported": dataset_result.get("frames_exported", 0),
+        "videos_in_dataset": dataset_result.get("videos_in_dataset", 0),
+        "total_dataset_frames": dataset_result.get("total_dataset_frames", 0),
+        "dataset_manifest": manifest,
+    })
+
+
+@app.get("/api/venue/model")
+def get_venue_model(venue_id: str = DEFAULT_VENUE_ID):
+    meta = load_model_meta(venue_id)
+    trained = has_trained_seg_model(venue_id)
+    return JSONResponse({
+        "venue_id": venue_id,
+        "trained": trained,
+        "model": meta,
+        "weights": meta.get("weights") if meta else None,
+        "metrics": meta.get("metrics") if meta else None,
+        "trained_at": meta.get("trained_at") if meta else None,
+        "classes": meta.get("classes", ["track", "sand"]) if meta else ["track", "sand"],
+    })
+
+
+@app.get("/api/venue/dataset")
+def get_venue_dataset(venue_id: str = DEFAULT_VENUE_ID):
+    from scripts.train_venue_seg import get_dataset_info
+
+    return JSONResponse(get_dataset_info(venue_id))
+
+
+@app.post("/api/venue/train")
+def post_venue_train(payload: VenueTrainPayload):
+    """Rebuild combined dataset from manifest and fine-tune CNN seg model."""
+    venue_id = payload.venue_id or DEFAULT_VENUE_ID
+    epochs = max(1, min(payload.epochs, 200))
+    imgsz = max(320, min(payload.imgsz, 1280))
+
+    from scripts.train_venue_seg import get_dataset_info, load_dataset_manifest
+
+    info = get_dataset_info(venue_id)
+    if info["total_frames"] < 5:
+        raise HTTPException(
+            400,
+            f"Dataset CNN insuficiente ({info['total_frames']} frames). "
+            "Usa 'Aprender de este video' en al menos un video con poligonos.",
+        )
+
+    job = create_job()
+    job.update({"result_video_name": venue_id})
+    job.start()
+
+    def _run():
+        import warnings
+        warnings.filterwarnings("ignore")
+        try:
+            from scripts.train_venue_seg import export_dataset_rebuild, train_venue_model
+
+            def on_progress(event: dict):
+                job.update(event)
+
+            manifest = load_dataset_manifest(venue_id)
+            export_dataset_rebuild(venue_id, manifest=manifest, on_progress=on_progress)
+            meta = train_venue_model(
+                venue_id,
+                epochs=epochs,
+                imgsz=imgsz,
+                model_name=payload.model,
+                on_progress=on_progress,
+            )
+            job.update({
+                "message": f"CNN entrenado: {meta.get('weights', '')}",
+                "percent": 100.0,
+            })
+            job.finish(venue_id)
+        except Exception as exc:
+            job.fail(str(exc))
+
+    threading.Thread(target=_run, daemon=True).start()
+
+    return JSONResponse({
+        "ok": True,
+        "job_id": job.job_id,
+        "venue_id": venue_id,
+        "epochs": epochs,
+        "total_dataset_frames": info["total_frames"],
+        "videos_in_dataset": info["video_count"],
+        "status": "started",
+        "poll": f"/api/jobs/{job.job_id}",
+        "warning": "El entrenamiento CNN puede tardar varios minutos.",
+    })
+
+
+@app.post("/api/venue/apply/{video_name}")
+def post_venue_apply(video_name: str, payload: VenueApplyPayload):
+    out_dir = OUTPUT_ROOT / video_name
+    analysis_path = out_dir / "analysis.json"
+    if not analysis_path.exists():
+        raise HTTPException(
+            404,
+            f"No analysis found for '{video_name}'. Run /analyze first.",
+        )
+    from src.calibration import load_calibration
+
+    cal_existing = load_calibration(out_dir)
+    use_cnn = payload.use_masks and has_trained_seg_model(payload.venue_id)
+    use_keyframe_pipeline = (
+        payload.use_masks
+        and not use_cnn
+        and cal_existing is not None
+        and should_use_keyframe_pipeline(cal_existing, prefer_keyframes=payload.prefer_keyframes)
+    )
+    profile = load_profile(payload.venue_id)
+    if not use_cnn and not use_keyframe_pipeline and profile is None:
+        raise HTTPException(
+            400,
+            "No venue profile learned. POST /api/venue/learn first, train CNN, or add manual keyframes.",
+        )
+    video_file = _resolve_video_path(video_name, out_dir, payload.video_path)
+    use_masks = payload.use_masks and (
+        use_cnn
+        or use_keyframe_pipeline
+        or (profile and int(profile.get("version", 2)) >= 3)
+    )
+    try:
+        if use_masks:
+            cal = apply_masks_to_output(
+                out_dir,
+                video_file,
+                profile=profile,
+                venue_id=payload.venue_id,
+                prefer_keyframes=payload.prefer_keyframes,
+            )
+        else:
+            cal = apply_profile_to_output(
+                out_dir,
+                video_file,
+                venue_id=payload.venue_id,
+                merge_existing=payload.merge,
+                prefer_propagation=payload.prefer_propagation,
+            )
+    except Exception as exc:
+        raise HTTPException(500, f"Venue apply failed: {exc}") from exc
+
+    frames_updated = 0
+    return JSONResponse({
+        "ok": True,
+        "video_name": video_name,
+        "mode": cal.get("mode", "venue_profile"),
+        "keyframes_applied": len(cal.get("keyframes", [])),
+        "mask_frames_applied": len(cal.get("mask_frames", {})),
+        "tracking_frames_updated": frames_updated,
+        "calibration": cal,
+    })
+
+
+@app.post("/api/venue/correct/{video_name}")
+def post_venue_correct(video_name: str, payload: VenueCorrectPayload):
+    """Apply manual track/sand mask correction and propagate via optical flow."""
+    out_dir = OUTPUT_ROOT / video_name
+    cal = load_calibration(out_dir)
+    if cal is None or cal.get("mode") != "color_masks":
+        raise HTTPException(
+            400,
+            f"No color_masks calibration for '{video_name}'. "
+            "Apply venue profile in Pista mode first.",
+        )
+    video_file = _resolve_video_path(video_name, out_dir, payload.video_path)
+    layer = payload.layer if payload.layer in ("track", "sand") else "track"
+    operation = payload.operation if payload.operation in ("add", "remove") else "add"
+    direction = payload.direction if payload.direction in ("both", "forward", "backward") else "both"
+    try:
+        result = apply_mask_correction(
+            video_file,
+            out_dir,
+            payload.frame_idx,
+            layer,
+            mask_grid=payload.mask_grid,
+            operation=operation,
+            radius=max(0, min(payload.radius, 120)),
+            direction=direction,
+            full_mask=payload.full_mask,
+        )
+    except Exception as exc:
+        raise HTTPException(500, f"Venue correction failed: {exc}") from exc
+    return JSONResponse({"ok": True, **result})
+
+
+@app.get("/api/venue/masks/{video_name}/{frame_idx}")
+def get_venue_masks(
+    video_name: str,
+    frame_idx: int,
+    format: str = "json",
+    video_path: Optional[str] = None,
+):
+    """Return venue track/sand mask info or composite overlay PNG."""
+    from src.mask_utils import composite_mask_overlay, load_mask_png, mask_area_norm
+
+    out_dir = OUTPUT_ROOT / video_name
+    cal = load_calibration(out_dir)
+    mask_modes = ("color_masks", "keyframe_masks", "cnn_masks")
+    if cal is None or cal.get("mode") not in mask_modes:
+        raise HTTPException(404, f"No venue masks calibration for '{video_name}'.")
+
+    entry = (cal.get("mask_frames") or {}).get(str(frame_idx))
+    if not entry:
+        raise HTTPException(404, f"No venue masks for frame {frame_idx}.")
+
+    track_path = out_dir / entry["track"]
+    sand_path = out_dir / entry["sand"]
+    track_mask = load_mask_png(track_path)
+    sand_mask = load_mask_png(sand_path)
+
+    if format == "overlay":
+        overlay = composite_mask_overlay(track_mask, sand_mask)
+        background = None
+        try:
+            vp = _resolve_video_path(video_name, out_dir, video_path)
+            cap = cv2.VideoCapture(str(vp))
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ok, frame = cap.read()
+            cap.release()
+            if ok and frame is not None:
+                background = frame
+        except HTTPException:
+            pass
+        if background is None:
+            frame_path = out_dir / "frames" / f"frame_{frame_idx:06d}.jpg"
+            if frame_path.exists():
+                background = cv2.imread(str(frame_path))
+        if background is not None:
+            if overlay.shape[:2] != background.shape[:2]:
+                overlay = cv2.resize(
+                    overlay, (background.shape[1], background.shape[0]),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+            blended = cv2.addWeighted(background, 1.0, overlay, 0.6, 0)
+            _, buf = cv2.imencode(".png", blended)
+            from fastapi.responses import Response
+            return Response(content=buf.tobytes(), media_type="image/png")
+        _, buf = cv2.imencode(".png", overlay)
+        from fastapi.responses import Response
+        return Response(content=buf.tobytes(), media_type="image/png")
+
+    vi_w = vi_h = 0
+    analysis_path = out_dir / "analysis.json"
+    if analysis_path.exists():
+        with open(analysis_path, encoding="utf-8") as f:
+            vi = json.load(f).get("video_info", {})
+        vi_w = int(vi.get("width", 0))
+        vi_h = int(vi.get("height", 0))
+
+    track_cov = mask_area_norm(track_mask, vi_w or 1280, vi_h or 720) if track_mask is not None else 0.0
+    sand_cov = mask_area_norm(sand_mask, vi_w or 1280, vi_h or 720) if sand_mask is not None else 0.0
+
+    return JSONResponse({
+        "frame_idx": frame_idx,
+        "confidence": entry.get("confidence"),
+        "track_coverage": round(track_cov, 4),
+        "sand_coverage": round(sand_cov, 4),
+        "track_url": _media_url(track_path),
+        "sand_url": _media_url(sand_path),
+        "overlay_url": (
+            f"/api/venue/masks/{video_name}/{frame_idx}?format=overlay"
+            + (f"&video_path={video_path}" if video_path else "")
+        ),
+    })
 
 
 def _media_url(path: Path | None) -> str:
@@ -185,12 +1060,25 @@ def _project_payload(video_path: str, output_dir: Optional[str] = None) -> dict:
     video_file = Path(video_path)
     video_name = _video_name(video_path)
     out_dir = Path(output_dir) if output_dir else OUTPUT_ROOT / video_name
+    duration_s = _video_duration(video_file) if video_file.exists() else 0.0
     analysis_path = out_dir / "analysis.json"
+    sections_path = out_dir / "sections.json"
     chart_path = out_dir / "charts" / "camera_angle_timeline.png"
     analysis_data = None
+    sections_data = None
     if analysis_path.exists():
         with open(analysis_path, encoding="utf-8") as f:
             analysis_data = json.load(f)
+    if sections_path.exists():
+        with open(sections_path, encoding="utf-8") as f:
+            sections_data = json.load(f)
+
+    frames = analysis_data.get("frames", []) if analysis_data else []
+    if sections_data and frames:
+        for frame in frames:
+            fidx = frame.get("frame_idx")
+            if fidx is not None:
+                frame["phase"] = phase_at_frame(sections_data, int(fidx))
 
     return {
         "video": {
@@ -199,13 +1087,19 @@ def _project_payload(video_path: str, output_dir: Optional[str] = None) -> dict:
             "video_name": video_name,
             "exists": video_file.exists(),
             "url": _media_url(video_file) if video_file.exists() else "",
+            "duration_s": duration_s,
         },
         "output": {"path": str(out_dir), "exists": out_dir.exists()},
         "analysis": {
             "path": str(analysis_path),
             "exists": analysis_path.exists(),
             "data": analysis_data,
-            "frames": analysis_data.get("frames", []) if analysis_data else [],
+            "frames": frames,
+        },
+        "sections": {
+            "path": str(sections_path),
+            "exists": sections_path.exists(),
+            "data": sections_data,
         },
         "assets": {
             "annotated": _indexed_images(out_dir / "annotated", "annotated_"),
@@ -368,6 +1262,7 @@ def _start_analysis_job(req: AnalyzeRequest) -> dict:
                 job.update(event)
 
             run_pipeline(config, on_progress=on_progress)
+            _maybe_auto_propagate_calibration(video_name, req.video_path)
             job.finish(video_name)
         except Exception as exc:
             job.fail(str(exc))
@@ -495,7 +1390,7 @@ def correct_frame(req: CorrectionRequest):
 
     model_pose, model_seg = _get_models()
     video_name = _video_name(req.video_path)
-    out_dir    = _output_dir(req.video_path)
+    out_dir    = _resolve_output_dir(req.video_path, req.output_dir)
     frames_dir = str(out_dir / "frames")
 
     # Load or create track state for this video
@@ -531,13 +1426,18 @@ def correct_frame(req: CorrectionRequest):
         all_dets  = detections_for_frame(frame_img, model_seg)
 
     # Apply correction
-    corrected_fa, corrected_mask = apply_correction(
-        correction=correction,
-        frame_path=frame_path,
-        model_pose=model_pose,
-        track_state=state,
-        all_detections=all_dets,
-    )
+    try:
+        corrected_fa, corrected_mask = apply_correction(
+            correction=correction,
+            frame_path=frame_path,
+            model_pose=model_pose,
+            track_state=state,
+            all_detections=all_dets,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
 
     # Save annotated frame
     annotated_path = str(out_dir / "annotated" / f"annotated_{req.frame_idx:06d}.jpg")
@@ -590,79 +1490,57 @@ def correct_frame(req: CorrectionRequest):
 
     # Serialize to JSON-safe dicts
     def _fa_to_dict(fa: FrameAnalysis) -> dict:
-        return {
-            "frame_idx":           fa.frame_idx,
-            "timestamp_s":         round(fa.timestamp_s, 3),
-            "person_detected":     fa.person_detected,
-            "track_id":            fa.track_id,
-            "camera_angle":        fa.camera_angle.value,
-            "shoulder_ratio":      round(fa.shoulder_ratio, 4),
-            "keypoints_valid":     fa.keypoints_valid_count,
-            "quality_score":       fa.quality_score,
-            "usable_for_analysis": fa.usable_for_analysis,
-            "manually_corrected":  fa.manually_corrected,
-            "correction_source":   fa.correction_source,
-            "tracking_source":     fa.tracking_source,
-            "has_mask":            fa.has_mask,
-            "mask_area_px":        fa.mask_area_px,
-            "annotated_image":     f"/frame/{video_name}/{fa.frame_idx}/annotated",
-        }
+        d = frame_analysis_to_dict(fa)
+        d["annotated_image"] = f"/frame/{video_name}/{fa.frame_idx}/annotated"
+        return d
 
     corrected_dict = _fa_to_dict(corrected_fa)
     updated_dicts  = [_fa_to_dict(fa) for fa in updated_fas]
 
-    # Patch analysis.json with updated frames
-    analysis = _load_analysis(video_name)
+    # Patch analysis.json with updated frames (same output dir as project)
+    analysis = _load_analysis_dir(out_dir)
+    saved_count = 0
     if analysis and "frames" in analysis:
-        idx_map = {f["frame_idx"]: i for i, f in enumerate(analysis["frames"])}
+        idx_map = {int(f["frame_idx"]): i for i, f in enumerate(analysis["frames"])}
         for d in [corrected_dict] + updated_dicts:
-            i = idx_map.get(d["frame_idx"])
+            i = idx_map.get(int(d["frame_idx"]))
             if i is not None:
-                analysis["frames"][i].update(d)
-        _save_analysis(video_name, analysis["frames"])
+                analysis["frames"][i] = _merge_frame_correction(analysis["frames"][i], d)
+                saved_count += 1
+        if saved_count:
+            derived = int(analysis.get("derived_version", 0)) + 1
+            _save_analysis_dir(out_dir, analysis["frames"], extra={"derived_version": derived})
+            _append_correction_log(out_dir, {
+                "frame_idx": req.frame_idx,
+                "correction_type": correction_type,
+                "frames_updated": saved_count,
+                "propagation_radius": effective_radius,
+                "sot_backend": req.sot_backend,
+            })
+        else:
+            print(f"  [Correction] WARNING: frame {req.frame_idx} not found in "
+                  f"{out_dir / 'analysis.json'} — correction not persisted")
+    else:
+        print(f"  [Correction] WARNING: no analysis.json in {out_dir} — correction not persisted")
+
+    pose_warning = None
+    if not corrected_fa.keypoints_valid_count:
+        pose_warning = (
+            "No se detecto pose en la region seleccionada. "
+            "Se guardo el bbox/mascara; prueba un area mas grande o usa bbox/click."
+        )
 
     return CorrectionResponse(
         corrected_frame=corrected_dict,
         updated_frames=updated_dicts,
         total_affected=1 + len(updated_dicts),
+        pose_warning=pose_warning,
     )
 
 
 def _build_fa_from_json(frame_data: dict) -> "FrameAnalysis":
     """Reconstruct a FrameAnalysis from a stored analysis.json frame entry."""
-    from src.pose_analyzer import (
-        FrameAnalysis, CameraAngle, KeypointData, CONF_THRESHOLD, KP,
-        _estimate_camera_angle, _compute_quality,
-    )
-    fa = FrameAnalysis(
-        frame_idx=frame_data.get("frame_idx", 0),
-        timestamp_s=frame_data.get("timestamp_s", 0.0),
-    )
-    fa.person_detected     = frame_data.get("person_detected", False)
-    fa.track_id            = frame_data.get("track_id")
-    fa.has_mask            = frame_data.get("has_mask", False)
-    fa.mask_area_px        = frame_data.get("mask_area_px", 0)
-    fa.quality_score       = frame_data.get("quality_score", 0.0)
-    fa.usable_for_analysis = frame_data.get("usable_for_analysis", False)
-    fa.manually_corrected  = frame_data.get("manually_corrected", False)
-    fa.correction_source   = frame_data.get("correction_source", "auto")
-    fa.shoulder_ratio      = frame_data.get("shoulder_ratio", 0.0)
-    fa.angle_confidence    = frame_data.get("angle_confidence", 0.0)
-    fa.torso_height_px     = frame_data.get("torso_height_px", 0.0)
-    fa.shoulder_width_px   = frame_data.get("shoulder_width_px", 0.0)
-    fa.body_height_px      = frame_data.get("body_height_px", 0.0)
-
-    try:
-        fa.camera_angle = CameraAngle(frame_data.get("camera_angle", "UNKNOWN"))
-    except ValueError:
-        fa.camera_angle = CameraAngle.UNKNOWN
-
-    # bbox from stored data (not always present)
-    if frame_data.get("person_bbox"):
-        fa.person_bbox = tuple(frame_data["person_bbox"])
-
-    fa.keypoints_valid_count = frame_data.get("keypoints_valid", 0)
-    return fa
+    return frame_record_to_analysis(frame_data)
 
 
 @app.get("/frame/{video_name}/{frame_idx}")

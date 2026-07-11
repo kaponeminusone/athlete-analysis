@@ -117,6 +117,13 @@ def apply_correction(
 
     seg_mask = _mask_from_correction(correction, img.shape)
 
+    if correction.correction_type == "mask_correction":
+        if seg_mask is None or not seg_mask.any():
+            raise ValueError(
+                f"La mascara esta vacia en el frame {correction.frame_idx}. "
+                "Pinta sobre el atleta antes de aplicar."
+            )
+
     # ── Click selection: pick nearest YOLO detection ──────────────────────────
     if correction.correction_type == "click_selection" and all_detections:
         cx, cy = int(correction.data["x"]), int(correction.data["y"])
@@ -152,30 +159,45 @@ def apply_correction(
     # ── Crop and run pose ─────────────────────────────────────────────────────
     crop, (ox, oy, _) = _padded_crop(img, x1, y1, x2, y2, pad=0.15)
     if crop.size == 0:
-        raise ValueError(f"Corrected crop is empty for frame {correction.frame_idx}")
+        raise ValueError(
+            f"La region corregida esta vacia en el frame {correction.frame_idx}. "
+            "Pinta un area mas grande con el mask brush."
+        )
 
-    pose_results = model_pose(crop, verbose=False, conf=0.25)
-    if not pose_results or pose_results[0].keypoints is None or \
-       len(pose_results[0].keypoints.xy) == 0:
-        raise ValueError(f"Pose estimation returned no results for frame {correction.frame_idx}")
+    kps_xy_full = None
+    kps_conf    = None
+    pose_detected = False
 
-    # Pick best (largest) detection in crop
-    crop_boxes = pose_results[0].boxes
-    if crop_boxes is not None and len(crop_boxes) > 1:
-        crop_areas = [(b[2]-b[0])*(b[3]-b[1])
-                      for b in crop_boxes.xyxy.cpu().numpy()]
-        best_idx = int(np.argmax(crop_areas))
-    else:
-        best_idx = 0
+    for conf in (0.25, 0.1):
+        pose_results = model_pose(crop, verbose=False, conf=conf)
+        if not pose_results or pose_results[0].keypoints is None or \
+           len(pose_results[0].keypoints.xy) == 0:
+            continue
 
-    kps_xy_crop = pose_results[0].keypoints.xy.cpu().numpy()[best_idx]
-    kps_conf    = pose_results[0].keypoints.conf.cpu().numpy()[best_idx]
+        crop_boxes = pose_results[0].boxes
+        if crop_boxes is not None and len(crop_boxes) > 1:
+            crop_areas = [(b[2]-b[0])*(b[3]-b[1])
+                          for b in crop_boxes.xyxy.cpu().numpy()]
+            best_idx = int(np.argmax(crop_areas))
+        else:
+            best_idx = 0
 
-    kps_xy_full = kps_xy_crop.copy()
-    kps_xy_full[:, 0] += ox
-    kps_xy_full[:, 1] += oy
+        kps_xy_crop = pose_results[0].keypoints.xy.cpu().numpy()[best_idx]
+        kps_conf    = pose_results[0].keypoints.conf.cpu().numpy()[best_idx]
+        kps_xy_full = kps_xy_crop.copy()
+        kps_xy_full[:, 0] += ox
+        kps_xy_full[:, 1] += oy
+        pose_detected = True
+        break
 
     mask_area = int(seg_mask.sum()) if seg_mask is not None else 0
+    if not pose_detected:
+        print(f"  [Correction] WARNING: no pose in crop for frame {correction.frame_idx} "
+              f"— saving bbox/mask only (area={mask_area}px)")
+
+    quality = 1.0 if pose_detected else round(
+        max(0.2, min(0.45, 0.2 + mask_area / 60000.0)), 3
+    )
 
     tracker_result = {
         "found":          True,
@@ -186,7 +208,7 @@ def apply_correction(
         "kps_xy":         kps_xy_full,
         "kps_conf":       kps_conf,
         "seg_mask":       seg_mask,
-        "quality_score":  1.0,           # human-verified = max quality
+        "quality_score":  quality,
         "appearance_sim": 1.0,
     }
 
@@ -207,7 +229,8 @@ def apply_correction(
 
     print(f"  [Correction] Frame {correction.frame_idx} corrected via "
           f"{correction.correction_type} — kps valid: "
-          f"{fa.keypoints_valid_count}/11, Q={fa.quality_score:.2f}")
+          f"{fa.keypoints_valid_count}/11, Q={fa.quality_score:.2f}"
+          f"{'' if fa.keypoints_valid_count else ' (bbox/mask only)'}")
 
     return fa, seg_mask
 

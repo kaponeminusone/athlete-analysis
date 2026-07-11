@@ -1,0 +1,162 @@
+{
+  "schema_version": 1,
+  "athlete_id": "Mateo",
+  "phases": {
+    "hop_1": {
+      "centroid": [
+        0.8291,
+        0.7145,
+        0.5149,
+        0.7714,
+        0.758,
+        0.1146,
+        0.8556,
+        0.2977,
+        0.5856,
+        0.2032,
+        0.7345,
+        0.6656,
+        0.0,
+        0.4564
+      ],
+      "weights": [
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "sample_count": 2,
+      "feature_names": [
+        "l_knee_angle",
+        "r_knee_angle",
+        "torso_lean",
+        "ankle_sep_norm",
+        "foot_asymmetry",
+        "leg_extension_asym",
+        "avg_foot_height",
+        "arch_score",
+        "hop_contact_score",
+        "flight_score",
+        "running_score",
+        "landing_score",
+        "feet_together_score",
+        "body_extension"
+      ]
+    },
+    "approach": {
+      "centroid": [
+        0.8978,
+        0.9846,
+        0.5157,
+        0.4602,
+        0.4353,
+        0.0867,
+        0.9346,
+        0.0957,
+        0.3838,
+        0.1261,
+        0.894,
+        0.8756,
+        0.0959,
+        0.1176
+      ],
+      "weights": [
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "sample_count": 1,
+      "feature_names": [
+        "l_knee_angle",
+        "r_knee_angle",
+        "torso_lean",
+        "ankle_sep_norm",
+        "foot_asymmetry",
+        "leg_extension_asym",
+        "avg_foot_height",
+        "arch_score",
+        "hop_contact_score",
+        "flight_score",
+        "running_score",
+        "landing_score",
+        "feet_together_score",
+        "body_extension"
+      ]
+    }
+  },
+  "pose_tags": {
+    "hop_contact": {
+      "centroid": [
+        0.7592,
+        0.7187,
+        0.5189,
+        0.568,
+        0.5493,
+        0.1257,
+        0.8776,
+        0.3587,
+        0.5013,
+        0.1664,
+        0.7782,
+        0.6639,
+        0.1618,
+        0.5221
+      ],
+      "weights": [
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "sample_count": 12,
+      "feature_names": [
+        "l_knee_angle",
+        "r_knee_angle",
+        "torso_lean",
+        "ankle_sep_norm",
+        "foot_asymmetry",
+        "leg_extension_asym",
+        "avg_foot_height",
+        "arch_score",
+        "hop_contact_score",
+        "flight_score",
+        "running_score",
+        "landing_score",
+        "feet_together_score",
+        "body_extension"
+      ]
+    }
+  },
+  "updated_from": "approach"
+}

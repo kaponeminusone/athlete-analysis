@@ -1,0 +1,6 @@
+path: C:/Users/RALSEI/Documents/Cursor/prototype/venues/default/dataset
+train: images/train
+val: images/val
+names:
+  0: track
+  1: sand

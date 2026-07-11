@@ -1,0 +1,115 @@
+{
+  "version": 3,
+  "venue_id": "default",
+  "videos_contributed": [
+    "VOD2.MOV",
+    "VOD3.mp4",
+    "VOD4.mp4",
+    "VOD5.mp4",
+    "VOD6.mp4",
+    "VOD7.mp4"
+  ],
+  "accumulated_samples": true,
+  "source_video": "VOD7.mp4",
+  "learned_at": "2026-07-11T11:10:18.812157+00:00",
+  "frames_used": 212,
+  "sand_frames_used": 87,
+  "learned_from_manual": true,
+  "video_size": [
+    848,
+    478
+  ],
+  "track_color": {
+    "mean_hsv": [
+      47.95838283170999,
+      21.463079854828518,
+      205.4196362873858
+    ],
+    "std_hsv": [
+      30.474198212533853,
+      29.618670121195485,
+      26.854592090013035
+    ],
+    "sample_count": 13052016,
+    "negative_samples_count": 0
+  },
+  "track_hsv": {
+    "mean": [
+      47.95838283170999,
+      21.463079854828518,
+      205.4196362873858
+    ],
+    "std": [
+      30.474198212533853,
+      29.618670121195485,
+      26.854592090013035
+    ],
+    "sample_count": 13052016,
+    "negative_samples_count": 0
+  },
+  "track_hsv_range": {
+    "low": [
+      35,
+      10,
+      165
+    ],
+    "high": [
+      94,
+      66,
+      246
+    ]
+  },
+  "expected_area_norm": 0.04071048795480681,
+  "expected_aspect_ratio": 9.119614403608647,
+  "expected_center": [
+    0.5022110939025879,
+    0.776150643825531
+  ],
+  "shape_stats": {
+    "area_norm": 0.04071048795480681,
+    "aspect_ratio": 9.119614403608647,
+    "center_x": 0.5022110939025879,
+    "center_y": 0.776150643825531
+  },
+  "lane_angle_deg": 0.0,
+  "sand_color": {
+    "mean_hsv": [
+      20.71871928264895,
+      132.7599759937638,
+      216.18209274209076
+    ],
+    "std_hsv": [
+      6.019229439702464,
+      17.0249198501197,
+      28.51670569175941
+    ],
+    "sample_count": 3467434,
+    "negative_samples_count": 0
+  },
+  "sand_hsv": {
+    "mean": [
+      20.71871928264895,
+      132.7599759937638,
+      216.18209274209076
+    ],
+    "std": [
+      6.019229439702464,
+      17.0249198501197,
+      28.51670569175941
+    ],
+    "sample_count": 3467434,
+    "negative_samples_count": 0
+  },
+  "sand_hsv_range": {
+    "low": [
+      12,
+      107,
+      173
+    ],
+    "high": [
+      30,
+      158,
+      255
+    ]
+  }
+}

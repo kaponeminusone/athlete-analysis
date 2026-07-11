@@ -20,6 +20,12 @@ from .pose_analyzer   import FrameAnalysis, CameraAngle, analyze_frame, analyze_
 from .athlete_tracker import TrackState, run_tracked_frame
 from .visualizer      import annotate_frame, generate_timeline_chart
 from .job_store       import ProgressCallback, noop_progress
+from .schemas         import (
+    build_analysis_document,
+    frame_analysis_to_dict,
+    write_derived_stubs,
+)
+from .track_scorer      import TrackScorerContext
 
 
 @dataclass
@@ -104,6 +110,10 @@ def run_pipeline(
     # ── Stage: tracking / analyzing_pose ──────────────────────────────────────
     use_tracker     = model_seg is not None
     track_state     = TrackState()
+    output_path     = Path(config.output_dir)
+    track_scorer    = TrackScorerContext.from_output_dir(
+        output_path, info["width"], info["height"],
+    )
     analyses: list[FrameAnalysis] = []
     tracker_outputs: list[dict]   = []
     annotated_count = 0
@@ -131,6 +141,7 @@ def run_pipeline(
                 state=track_state,
                 frame_idx=frame_abs,
                 model_pose=pose_model_this_frame,
+                track_scorer=track_scorer,
             )
 
             if is_analysis_frame:
@@ -224,43 +235,41 @@ def run_pipeline(
     })
 
     summary = _summarize(analyses, analysis_count)
+    output_path = Path(config.output_dir)
 
-    result_data = {
-        "video": config.video_path,
-        "video_info": info,
-        "config": {
+    frames_data = [
+        frame_analysis_to_dict(
+            a,
+            appearance_sim=(
+                tracker_outputs[i].get("appearance_sim", 0.0)
+                if i < len(tracker_outputs) else 0.0
+            ),
+            extra={
+                k: tracker_outputs[i].get(k)
+                for k in ("track_overlap", "athlete_state", "position_s", "predicted_bbox")
+                if i < len(tracker_outputs) and tracker_outputs[i].get(k) is not None
+            } if i < len(tracker_outputs) else None,
+        )
+        for i, a in enumerate(analyses)
+    ]
+
+    result_data = build_analysis_document(
+        video_path=config.video_path,
+        video_info=info,
+        config={
             "stride":      config.stride,
             "start_sec":   config.start_sec,
             "end_sec":     config.end_sec,
             "use_tracker": use_tracker,
         },
-        "summary": summary,
-        "frames": [
-            {
-                "frame_idx":           a.frame_idx,
-                "timestamp_s":         round(a.timestamp_s, 3),
-                "person_detected":     a.person_detected,
-                "track_id":            a.track_id,
-                "camera_angle":        a.camera_angle.value,
-                "shoulder_ratio":      round(a.shoulder_ratio, 4),
-                "angle_confidence":    round(a.angle_confidence, 4),
-                "keypoints_valid":     a.keypoints_valid_count,
-                "quality_score":       a.quality_score,
-                "usable_for_analysis": a.usable_for_analysis,
-                "has_mask":            a.has_mask,
-                "mask_area_px":        a.mask_area_px,
-                "torso_height_px":     round(a.torso_height_px, 1),
-                "shoulder_width_px":   round(a.shoulder_width_px, 1),
-                "body_height_px":      round(a.body_height_px, 1),
-                "appearance_sim":      (tracker_outputs[i].get("appearance_sim", 0.0)
-                                        if i < len(tracker_outputs) else 0.0),
-                "tracking_source":     a.tracking_source,
-            }
-            for i, a in enumerate(analyses)
-        ],
-    }
+        summary=summary,
+        frames=frames_data,
+        output_dir=output_path,
+    )
 
-    json_path = Path(config.output_dir) / "analysis.json"
+    write_derived_stubs(output_path)
+
+    json_path = output_path / "analysis.json"
     with open(json_path, "w") as f:
         json.dump(result_data, f, indent=2)
 
