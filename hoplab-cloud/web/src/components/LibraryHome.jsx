@@ -42,7 +42,8 @@ function Avatar({ athlete, size = "h-8 w-8", text = "text-xs" }) {
 
 function Thumb({ src, alt, className }) {
   const [loaded, setLoaded] = useState(false);
-  if (!src) {
+  const [failed, setFailed] = useState(false);
+  if (!src || failed) {
     return <div className={`relative overflow-hidden bg-elevated ${className}`} aria-hidden />;
   }
   return (
@@ -53,6 +54,7 @@ function Thumb({ src, alt, className }) {
         alt={alt}
         className={`h-full w-full object-cover transition-opacity duration-300 ${loaded ? "opacity-100" : "opacity-0"}`}
         onLoad={() => setLoaded(true)}
+        onError={() => setFailed(true)}
         draggable={false}
       />
     </div>

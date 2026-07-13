@@ -46,8 +46,13 @@ def _cache_put(key: tuple[str, int], img: np.ndarray) -> None:
         _frame_cache.popitem(last=False)
 
 
+_VIDEO_EXTS = (".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v")
+
+
 def _resolve_video_path(video_name: str, output_root: Path) -> Optional[str]:
-    """Resolver el video fuente desde analysis.json (campo "video")."""
+    """Resolver el video fuente: analysis.json → HOPLAB_VIDEO_ROOT por stem."""
+    import os
+
     try:
         analysis_path = Path(output_root) / video_name / "analysis.json"
         if analysis_path.exists():
@@ -57,6 +62,24 @@ def _resolve_video_path(video_name: str, output_root: Path) -> Optional[str]:
             if vp and Path(vp).exists():
                 return str(vp)
     except (OSError, ValueError, json.JSONDecodeError):
+        pass
+
+    # Sin analysis aún (p. ej. poster de biblioteca): buscar en VIDEO_ROOT
+    video_root = Path(os.getenv("HOPLAB_VIDEO_ROOT", ".")).resolve()
+    stem = Path(str(video_name)).stem  # por si viene con extensión
+    # Quitar sufijo _refined para apuntar al MP4 original
+    if stem.endswith("_refined"):
+        stem = stem[: -len("_refined")]
+    try:
+        if video_root.is_dir():
+            for path in video_root.rglob("*"):
+                if not path.is_file():
+                    continue
+                if path.suffix.lower() not in _VIDEO_EXTS:
+                    continue
+                if path.stem == stem:
+                    return str(path.resolve())
+    except OSError:
         pass
     return None
 

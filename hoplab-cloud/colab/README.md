@@ -6,15 +6,27 @@
 
 Notebook **Open in Colab** estilo ComfyUI.
 
+## Estructura del notebook
+
+| Sección | Contenido |
+|---------|-----------|
+| **0. Configuración** | Repo, Drive, `HOPLAB_DATA_FOLDER_ID` (única celda a editar) |
+| **1. Solo owner** | Bootstrap Drive una vez (colapsar / omitir después) |
+| **2. Setup** | GPU → Drive → clone → install → env/symlinks |
+| **3. Arrancar API** | uvicorn + logs en `DATA_ROOT/logs/hoplab-api.log` |
+| **4. Túnel + URL** | cloudflared + URL para Vercel (fallback localtunnel colapsable) |
+| **5. Terminal** | Panel HTML live (▶ debe quedar corriendo) — si no ves texto, la celda no se ejecutó |
+
 ## Uso previsto (owner)
 
 1. Abrir `HopLab_Server.ipynb` con el badge (cuando exista).
 2. Runtime → GPU.
-3. **Una vez:** ejecutar la celda «SOLO OWNER: crear estructura Drive» (o `owner_bootstrap_drive.py`) antes de invitar invitados; anota el folder ID.
+3. **Una vez:** ejecutar la sección «1. Solo owner» (o `owner_bootstrap_drive.py`) antes de invitar invitados; anota el folder ID.
 4. Dejar `HOPLAB_DATA_FOLDER_ID = ""` (usa `MyDrive/hoplab-data`).
-5. Runtime → Run all.
-6. Copiar la URL `*.trycloudflare.com` impresa.
+5. Runtime → Run all (o ejecutar secciones 0–5).
+6. Copiar la URL `*.trycloudflare.com` de la sección **4**.
 7. Pegarla en la UI desplegada (Conectar motor).
+8. Ejecutá la celda **Terminal** (sección 5, play ▶) y dejala corriendo; debe mostrar el panel HTML + logs. Si no ves texto, la celda no se ejecutó. Stop = interrupt.
 
 ## Carpeta compartida (owner + invitado)
 
@@ -39,6 +51,7 @@ Varias personas pueden **Run All** en Colab con su propia cuenta, pero leer/escr
    `/content/drive/.shortcut-targets-by-id/<FOLDER_ID>/`
    (no en tu `MyDrive/hoplab-data` vacío).
 6. Pega la URL del túnel en la UI de Vercel (Conectar motor).
+7. Ejecutá la **Terminal** (sección 5, play ▶) y dejala corriendo; debe mostrar el panel HTML.
 
 Si la ruta por ID no existe tras el mount: acepta el share, espera unos segundos y re-ejecuta la celda de Drive.
 
@@ -58,7 +71,7 @@ Orden de resolución: `HOPLAB_DATA_ROOT` → `HOPLAB_DATA_FOLDER_ID` → `MyDriv
 
 | Archivo | Rol |
 |---------|-----|
-| `HopLab_Server.ipynb` | Celdas mount → install → API → tunnel |
+| `HopLab_Server.ipynb` | Setup → API → túnel/URL → Terminal (live logs) |
 | `owner_bootstrap_drive.py` | Owner: crear `hoplab-data` + folder ID (una vez) |
 | `requirements-colab.txt` | Deps pinneadas para Colab |
 

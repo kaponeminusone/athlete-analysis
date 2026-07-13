@@ -101,12 +101,14 @@ export default function SidePanel({
   const [trainMsg, setTrainMsg] = useState(null);
   const timer = useRef(null);
   const autoRan = useRef(false);
+  const analyzeInFlight = useRef(false);
   const tone = successTone(successPct);
 
   async function analyze() {
-    if (progress != null) return;
+    if (progress != null || analyzeInFlight.current) return;
 
     if (onAnalyze) {
+      analyzeInFlight.current = true;
       setProgress(0);
       setProgressMsg(null);
       try {
@@ -125,6 +127,8 @@ export default function SidePanel({
         setProgress(null);
         setProgressMsg(null);
         toast(err.message || "Error al analizar");
+      } finally {
+        analyzeInFlight.current = false;
       }
       return;
     }
@@ -169,12 +173,22 @@ export default function SidePanel({
   // Auto-arranque del análisis (al llegar desde "Analizar" en la biblioteca).
   useEffect(() => {
     if (!autoStart || autoRan.current) return;
-    if (!onAnalyze || hasAnalysis || progress != null) return;
+    if (!onAnalyze || hasAnalysis || progress != null || analyzeInFlight.current) return;
     autoRan.current = true;
     onAutoStartConsumed?.();
-    analyze();
+    void analyze();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autoStart, onAnalyze, hasAnalysis]);
+  }, [autoStart, onAnalyze, hasAnalysis, progress]);
+
+  // Tras consumir autoStart (false), permitir un nuevo pulso (p. ej. "Analizar ahora").
+  useEffect(() => {
+    if (!autoStart) autoRan.current = false;
+  }, [autoStart]);
+
+  // Nueva sesión / video → limpiar guarda.
+  useEffect(() => {
+    autoRan.current = false;
+  }, [videoName, videoPath]);
 
   /** Aprende colores de pista/arena de este video (venue/learn, síncrono). */
   async function learnVenueNow() {

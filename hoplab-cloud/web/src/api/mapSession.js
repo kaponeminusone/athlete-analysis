@@ -398,7 +398,11 @@ export async function loadLibraryFromApi() {
         date: "",
         note: v.has_refined ? "Versión refinada disponible" : v.has_analysis ? "Con análisis" : "Pendiente de procesar",
         durationLabel: formatDurationLabel(v.duration_s),
-        thumb: v.has_analysis ? frameUrl(apiName, 0, { annotated: true }) : "",
+        // Siempre URL absoluta vía getApiBase(); sin analysis, /frame decodifica el MP4.
+        thumb: frameUrl(v.video_name, 0, {
+          annotated: Boolean(v.has_analysis),
+          videoPath: v.path,
+        }),
         analysis: v.has_analysis ? "partial" : "none",
         poseQualities: [],
         successPct: null,
@@ -413,7 +417,10 @@ export async function loadLibraryFromApi() {
         const project = await getProject(v.path, base.outputDir);
         const frames = project.analysis?.frames || [];
         const firstIdx = frames[0]?.frame_idx ?? 0;
-        base.thumb = frameUrl(apiName, firstIdx, { annotated: true });
+        base.thumb = frameUrl(apiName, firstIdx, {
+          annotated: true,
+          videoPath: v.path,
+        });
 
         let metrics = project.metrics?.data;
         const sections = project.sections?.data;

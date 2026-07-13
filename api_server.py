@@ -1853,15 +1853,28 @@ def _jpeg_response(img: "np.ndarray"):
 
 
 @app.get("/frame/{video_name}/{frame_idx}")
-def get_frame(video_name: str, frame_idx: int, annotated: bool = True):
+def get_frame(
+    video_name: str,
+    frame_idx: int,
+    annotated: bool = True,
+    video_path: Optional[str] = None,
+):
     """
     Serve a frame image. If annotated=True and the pre-generated annotated
     image doesn't exist, regenerate it (in memory, or on disk when
     TJ_WRITE_ANNOTATED is on) from analysis.json data. The raw frame is
     resolved via read_frame_bgr, so it works even without frames/*.jpg on disk
-    (decoding from the source video as a fallback).
+    (decoding from the source video as a fallback — including videos that
+    still have no analysis.json, via video_path query or HOPLAB_VIDEO_ROOT).
     """
     from fastapi.responses import Response as RawResponse
+
+    # Si el caller pasa video_path (biblioteca sin analysis), validar existencia.
+    resolved_vp: Optional[str] = None
+    if video_path:
+        vp = Path(video_path)
+        if vp.exists():
+            resolved_vp = str(vp.resolve())
 
     if annotated:
         ann_path = OUTPUT_ROOT / video_name / "annotated" / f"annotated_{frame_idx:06d}.jpg"
@@ -1878,7 +1891,9 @@ def get_frame(video_name: str, frame_idx: int, annotated: bool = True):
                 return RawResponse(content=cached, media_type="image/jpeg")
 
         # 3) Regenerar: frame crudo (disco o video) + datos de analysis.json
-        img = read_frame_bgr(video_name, frame_idx, OUTPUT_ROOT)
+        img = read_frame_bgr(
+            video_name, frame_idx, OUTPUT_ROOT, video_path=resolved_vp,
+        )
         analysis = _load_analysis(video_name)
         if img is not None and analysis and "frames" in analysis:
             frame_data = next(
@@ -1919,7 +1934,9 @@ def get_frame(video_name: str, frame_idx: int, annotated: bool = True):
     raw_path = OUTPUT_ROOT / video_name / "frames" / f"frame_{frame_idx:06d}.jpg"
     if raw_path.exists():
         return FileResponse(str(raw_path), media_type="image/jpeg")
-    img = read_frame_bgr(video_name, frame_idx, OUTPUT_ROOT)
+    img = read_frame_bgr(
+        video_name, frame_idx, OUTPUT_ROOT, video_path=resolved_vp,
+    )
     if img is None:
         raise HTTPException(404, f"Frame {frame_idx} not found for {video_name}")
     return _jpeg_response(img)

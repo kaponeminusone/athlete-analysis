@@ -44,10 +44,11 @@ export default function Timeline({
   );
 
   const ticks = useMemo(() => {
+    if (!frameCount || !frames?.length) return [];
     const count = 6;
     return Array.from({ length: count }, (_, k) => {
       const i = Math.round((k / (count - 1)) * (frameCount - 1));
-      return { i, frameId: frames[i].frameId };
+      return { i, frameId: frames[i]?.frameId ?? i };
     });
   }, [frames, frameCount]);
 

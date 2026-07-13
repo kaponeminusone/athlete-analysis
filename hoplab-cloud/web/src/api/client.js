@@ -167,9 +167,15 @@ export function poseOverlayUrl(videoName, phase, outputDir, cacheKey) {
   ).toString();
 }
 
-export function frameUrl(videoName, frameIdx, { annotated = true } = {}) {
+export function frameUrl(videoName, frameIdx, { annotated = true, videoPath } = {}) {
+  if (!videoName && videoName !== 0) return "";
+  const qs = new URLSearchParams({
+    annotated: annotated ? "true" : "false",
+  });
+  // Videos sin analysis.json: el motor necesita la ruta para decodificar el MP4.
+  if (videoPath) qs.set("video_path", String(videoPath));
   return absUrl(
-    `/frame/${encodeURIComponent(videoName)}/${frameIdx}?annotated=${annotated ? "true" : "false"}`,
+    `/frame/${encodeURIComponent(videoName)}/${frameIdx}?${qs.toString()}`,
   );
 }
 
