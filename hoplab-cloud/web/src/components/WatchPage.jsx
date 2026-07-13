@@ -39,6 +39,13 @@ import {
   scaleMetrics,
 } from "../api/client";
 import { loadWatchSession, sessionSuccessPct } from "../api/mapSession";
+import {
+  clearFrameCache,
+  ensureBlobUrl,
+  frameUrlsFromList,
+  prioritizeFrameUrls,
+  warmupFrameUrls,
+} from "../api/frameCache";
 import { resolveSession, successTone } from "../mock/data";
 
 /** Quita el sufijo _refined para operar sobre el primer pase. */
@@ -205,7 +212,7 @@ export default function WatchPage({ athlete, session, autoAnalyze = false, onBac
   const [autoStart, setAutoStart] = useState(false);
   const autoStartDone = useRef(false);
   const [config, setConfig] = useState({
-    stride: 2,
+    stride: 3,
     range: "all",
     startSec: 0,
     endSec: null,
@@ -223,9 +230,13 @@ export default function WatchPage({ athlete, session, autoAnalyze = false, onBac
   const [previewTimeSec, setPreviewTimeSec] = useState(0);
   const [previewDurationSec, setPreviewDurationSec] = useState(null);
   const [rawVideoError, setRawVideoError] = useState(false);
+  const [frameBlobSrc, setFrameBlobSrc] = useState("");
+  const [warmup, setWarmup] = useState({ done: 0, total: 0, label: "" });
 
-  // Nueva sesión → permitir otro autoAnalyze / autoStart.
+  // Nueva sesión → limpiar caché de blobs y permitir autoAnalyze.
   useEffect(() => {
+    clearFrameCache();
+    setWarmup({ done: 0, total: 0, label: "" });
     autoStartDone.current = false;
     setAutoStart(false);
     setPreviewTimeSec(0);
@@ -331,34 +342,17 @@ export default function WatchPage({ athlete, session, autoAnalyze = false, onBac
     [frameIndex, seek],
   );
 
-  // Prefetch ±8 vecinos (raw + annotated si tracking). Ignora generaciones stale al scrubear rápido.
-  const prefetchGen = useRef(0);
+  // Precarga en background (toda la secuencia) para scrub fluido en Colab/túnel.
   useEffect(() => {
-    if (!frames.length || frameCount < 2) return undefined;
-    const gen = ++prefetchGen.current;
-    const timer = window.setTimeout(() => {
-      if (gen !== prefetchGen.current) return;
-      for (let d = -8; d <= 8; d++) {
-        if (d === 0) continue;
-        const i = frameIndex + d;
-        if (i < 0 || i >= frameCount) continue;
-        const f = frames[i];
-        if (!f) continue;
-        const urls = [f.raw];
-        if (trackingOn && f.annotated) urls.push(f.annotated);
-        for (const u of urls) {
-          if (!u) continue;
-          const src = `${u}${u.includes("?") ? "&" : "?"}v=${reloadToken}`;
-          const img = new Image();
-          img.decoding = "async";
-          img.src = src;
-        }
-      }
-    }, 50);
-    return () => {
-      window.clearTimeout(timer);
-    };
-  }, [frameIndex, frameCount, frames, trackingOn, reloadToken]);
+    if (loadState !== "ready" || !frames.length || frameCount < 1) return undefined;
+    const urls = frameUrlsFromList(frames, { annotated: trackingOn });
+    const stopTick = warmupFrameUrls(urls, {
+      version: reloadToken,
+      label: trackingOn ? "anotados" : "raw",
+      onProgress: setWarmup,
+    });
+    return stopTick;
+  }, [loadState, frames, frameCount, trackingOn, reloadToken, session.id]);
 
   // Reproducción ~fps de la secuencia de frames.
   useEffect(() => {
@@ -795,6 +789,43 @@ export default function WatchPage({ athlete, session, autoAnalyze = false, onBac
   const frameSrc = frameSrcRaw
     ? `${frameSrcRaw}${frameSrcRaw.includes("?") ? "&" : "?"}v=${reloadToken}`
     : "";
+  const stageSrc = frameBlobSrc || frameSrc;
+
+  // Prioriza frame visible ± vecinos al scrubear.
+  useEffect(() => {
+    if (!frames.length || frameCount < 1) return;
+    const radius = 16;
+    const urls = [];
+    for (let d = -radius; d <= radius; d++) {
+      const i = displayIndex + d;
+      if (i < 0 || i >= frameCount) continue;
+      const f = frames[i];
+      if (!f) continue;
+      urls.push(trackingOn ? f.annotated : f.raw);
+      if (trackingOn && f.raw) urls.push(f.raw);
+    }
+    prioritizeFrameUrls(urls, { version: reloadToken });
+  }, [displayIndex, frameCount, frames, trackingOn, reloadToken]);
+
+  // Blob URL en memoria → cambio de frame casi instantáneo si ya precargado.
+  useEffect(() => {
+    let cancelled = false;
+    if (!frameSrcRaw) {
+      setFrameBlobSrc("");
+      return undefined;
+    }
+    ensureBlobUrl(frameSrcRaw, reloadToken)
+      .then((blob) => {
+        if (!cancelled) setFrameBlobSrc(blob);
+      })
+      .catch(() => {
+        if (!cancelled) setFrameBlobSrc(frameSrc);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [frameSrcRaw, frameSrc, reloadToken]);
+
   const toolActive = activeTool != null;
   const canAccept = activeTool === "brush" ? brushCount > 0 : pistaCount > 0;
   const canClear = canAccept && !correcting;
@@ -875,6 +906,14 @@ export default function WatchPage({ athlete, session, autoAnalyze = false, onBac
           {successPct != null && (
             <span className={`rounded-md px-1.5 py-0.5 text-[11px] font-bold tabular-nums ring-1 ${tone.bg} ${tone.text} ${tone.ring}`}>
               {successPct}%
+            </span>
+          )}
+          {warmup.total > 0 && warmup.done < warmup.total && (
+            <span
+              className="hidden rounded-md bg-elevated px-2 py-0.5 text-[10px] tabular-nums text-muted ring-1 ring-border sm:inline"
+              title="Precarga en segundo plano para scrub fluido"
+            >
+              Precargando {warmup.label} {warmup.done}/{warmup.total}
             </span>
           )}
         </div>
@@ -980,7 +1019,7 @@ export default function WatchPage({ athlete, session, autoAnalyze = false, onBac
           >
             <div className="relative h-full w-full max-w-full">
               {frame ? (
-                <MediaStage src={frameSrc}>
+                <MediaStage src={stageSrc}>
                   {pistaOn && hasMasks && frame.trackMask && (
                     <>
                       <MaskLayer src={frame.trackMask} color="#22d3ee" opacity={0.42} />
@@ -1195,9 +1234,11 @@ export default function WatchPage({ athlete, session, autoAnalyze = false, onBac
           playing={playing}
           onTogglePlay={togglePlay}
           contacts={contacts}
+          onPreviewChange={setScrubPreview}
           onSeek={(i) => {
             seek(i);
             setPlaying(false);
+            setScrubPreview(null);
           }}
           onAddPhase={addPhase}
           onMoveContact={moveContact}

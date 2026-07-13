@@ -16,6 +16,7 @@ export default function Timeline({
   onTogglePlay,
   contacts,
   onSeek,
+  onPreviewChange,
   onAddPhase,
   onMoveContact,
 }) {
@@ -72,6 +73,7 @@ export default function Timeline({
     if (e.target.closest?.("[data-hop-marker]")) return;
     const i = indexFromClientX(e.clientX);
     setPreview(i);
+    onPreviewChange?.(i);
     e.currentTarget.setPointerCapture?.(e.pointerId);
     longPress.current = window.setTimeout(() => {
       setMenu({ index: i, x: e.clientX, y: e.clientY });
@@ -81,13 +83,16 @@ export default function Timeline({
   function onTrackMove(e) {
     if (preview == null) return;
     clearLongPress();
-    setPreview(indexFromClientX(e.clientX));
+    const i = indexFromClientX(e.clientX);
+    setPreview(i);
+    onPreviewChange?.(i);
   }
   function onTrackUp() {
     clearLongPress();
     if (menu) return;
     if (preview != null) onSeek(preview);
     setPreview(null);
+    onPreviewChange?.(null);
   }
 
   function onMarkerPointerDown(e, c, color) {
@@ -232,6 +237,7 @@ export default function Timeline({
           onPointerUp={onTrackUp}
           onPointerCancel={() => {
             setPreview(null);
+            onPreviewChange?.(null);
             clearLongPress();
           }}
         >

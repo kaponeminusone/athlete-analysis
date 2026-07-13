@@ -233,7 +233,7 @@ export async function trainVenue({ videoName, videoPath, venueId, epochs, imgsz,
   });
 }
 
-export async function analyzeVideo({ videoPath, stride = 2, startSec = 0, endSec = null }) {
+export async function analyzeVideo({ videoPath, stride = 3, startSec = 0, endSec = null }) {
   const body = {
     video_path: videoPath,
     stride: Number(stride) || 1,

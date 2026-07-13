@@ -182,6 +182,55 @@ def _frame_bytes_response(data: bytes):
     )
 
 
+# ─── Thumbnails (?w=) ─────────────────────────────────────────────────────────
+# Sirve JPEG reducidos para scrubbing fluido sobre el túnel de Colab.
+# Los bytes reducidos se cachean en el LRU existente (_annotated_bytes_cache),
+# con clave (video, idx, annotated, w, mtime). El almacenamiento se activa por
+# TJ_ANNOTATED_CACHE (thumbs anotados) o TJ_FRAME_CACHE (thumbs crudos), y el LRU
+# queda acotado por TJ_ANNOTATED_CACHE_MAX (comparte dict con los bytes anotados).
+_THUMB_CACHE_CONTROL = "public, max-age=300"
+_THUMB_JPEG_QUALITY = 70
+_THUMB_MIN_W = 16
+_THUMB_MAX_W = 4096
+
+
+def _parse_thumb_width(w) -> Optional[int]:
+    """Valida el query ?w=: entero en [16, 4096] o None (full-res)."""
+    if w is None:
+        return None
+    try:
+        value = int(w)
+    except (TypeError, ValueError):
+        return None
+    if value < _THUMB_MIN_W or value > _THUMB_MAX_W:
+        return None
+    return value
+
+
+def _thumb_bytes(img: "np.ndarray", target_w: int) -> Optional[bytes]:
+    """Reduce una imagen BGR a ancho target_w (preservando aspecto) y la
+    codifica JPEG (calidad ~70). Si ya es igual o más angosta, no reescala."""
+    h, w = img.shape[:2]
+    if w > target_w:
+        scale = target_w / float(w)
+        new_h = max(1, int(round(h * scale)))
+        img = cv2.resize(img, (target_w, new_h), interpolation=cv2.INTER_AREA)
+    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, _THUMB_JPEG_QUALITY])
+    if not ok:
+        return None
+    return buf.tobytes()
+
+
+def _thumb_response(data: bytes):
+    from fastapi.responses import Response as RawResponse
+
+    return RawResponse(
+        content=data,
+        media_type="image/jpeg",
+        headers={"Cache-Control": _THUMB_CACHE_CONTROL},
+    )
+
+
 def _get_models():
     if "pose" not in _models:
         from ultralytics import YOLO
@@ -1878,6 +1927,7 @@ def get_frame(
     frame_idx: int,
     annotated: bool = True,
     video_path: Optional[str] = None,
+    w: Optional[str] = None,
 ):
     """
     Serve a frame image. If annotated=True and the pre-generated annotated
@@ -1886,6 +1936,11 @@ def get_frame(
     resolved via read_frame_bgr, so it works even without frames/*.jpg on disk
     (decoding from the source video as a fallback — including videos that
     still have no analysis.json, via video_path query or HOPLAB_VIDEO_ROOT).
+
+    Optional query ?w=<px> returns a downscaled JPEG (aspect preserved, quality
+    ~70) — mucho más liviano sobre el túnel de Colab para scrubbing fluido. Sin
+    ?w= (o inválido) el comportamiento full-res es idéntico al anterior, incluida
+    la ruta rápida FileResponse cuando el JPEG ya existe en disco.
     """
     # Si el caller pasa video_path (biblioteca sin analysis), validar existencia.
     resolved_vp: Optional[str] = None
@@ -1894,16 +1949,37 @@ def get_frame(
         if vp.exists():
             resolved_vp = str(vp.resolve())
 
+    want_w = _parse_thumb_width(w)
+
     if annotated:
         ann_path = OUTPUT_ROOT / video_name / "annotated" / f"annotated_{frame_idx:06d}.jpg"
-        # 1) Pre-generado en disco → servir tal cual (compatibilidad, sin cambios)
+        mtime = _analysis_mtime(video_name)
+        thumb_cache = opt_flags.annotated_cache()
+        thumb_key = (video_name, frame_idx, True, want_w, mtime)
+
+        # 0) LRU de thumbs (comparte dict con bytes anotados)
+        if want_w is not None and thumb_cache:
+            cached = _annotated_cache_get(thumb_key)
+            if cached is not None:
+                return _thumb_response(cached)
+
+        # 1) Pre-generado en disco
         if ann_path.exists():
+            if want_w is None:
+                return _frame_file_response(str(ann_path))
+            disk_img = cv2.imread(str(ann_path))
+            if disk_img is not None:
+                data = _thumb_bytes(disk_img, want_w)
+                if data is not None:
+                    if thumb_cache:
+                        _annotated_cache_put(thumb_key, data)
+                    return _thumb_response(data)
             return _frame_file_response(str(ann_path))
 
-        # 2) LRU opcional de bytes anotados (default OFF)
+        # 2) LRU opcional de bytes anotados full-res (default OFF)
         use_cache = opt_flags.annotated_cache()
-        cache_key = (video_name, frame_idx, _analysis_mtime(video_name))
-        if use_cache:
+        cache_key = (video_name, frame_idx, mtime)
+        if want_w is None and use_cache:
             cached = _annotated_cache_get(cache_key)
             if cached is not None:
                 return _frame_bytes_response(cached)
@@ -1922,10 +1998,19 @@ def get_frame(
                 try:
                     fa = _build_fa_from_json(frame_data)
                     annotated_img = annotate_frame_array(img.copy(), fa)
+                    # Persistir a disco si la bandera está ON (acelera requests futuros)
                     if opt_flags.write_annotated():
-                        # Paridad con hoy: cachear en disco cuando la bandera está ON
                         ann_path.parent.mkdir(parents=True, exist_ok=True)
                         cv2.imwrite(str(ann_path), annotated_img)
+                    # Thumbnail: reducir + servir bytes livianos
+                    if want_w is not None:
+                        data = _thumb_bytes(annotated_img, want_w)
+                        if data is not None:
+                            if thumb_cache:
+                                _annotated_cache_put(thumb_key, data)
+                            return _thumb_response(data)
+                    # Full-res desde disco (si acabamos de escribirlo)
+                    if opt_flags.write_annotated() and ann_path.exists():
                         return _frame_file_response(str(ann_path))
                     # Modo lean: servir bytes sin escribir a disco
                     ok, buf = cv2.imencode(
@@ -1943,20 +2028,54 @@ def get_frame(
         # 4) Fallback final: frame crudo (disco tal cual, o decodificado del video)
         raw_path = OUTPUT_ROOT / video_name / "frames" / f"frame_{frame_idx:06d}.jpg"
         if raw_path.exists():
+            if want_w is None:
+                return _frame_file_response(str(raw_path))
+            disk_img = cv2.imread(str(raw_path))
+            if disk_img is not None:
+                data = _thumb_bytes(disk_img, want_w)
+                if data is not None:
+                    return _thumb_response(data)
             return _frame_file_response(str(raw_path))
         if img is not None:
+            if want_w is not None:
+                data = _thumb_bytes(img, want_w)
+                if data is not None:
+                    return _thumb_response(data)
             return _jpeg_response(img)
         raise HTTPException(404, f"Frame {frame_idx} not found for {video_name}")
 
     # raw
+    raw_thumb_cache = opt_flags.frame_cache()
+    raw_thumb_key = (video_name, frame_idx, False, want_w, 0.0)
+    if want_w is not None and raw_thumb_cache:
+        cached = _annotated_cache_get(raw_thumb_key)
+        if cached is not None:
+            return _thumb_response(cached)
+
     raw_path = OUTPUT_ROOT / video_name / "frames" / f"frame_{frame_idx:06d}.jpg"
     if raw_path.exists():
+        if want_w is None:
+            return _frame_file_response(str(raw_path))
+        disk_img = cv2.imread(str(raw_path))
+        if disk_img is not None:
+            data = _thumb_bytes(disk_img, want_w)
+            if data is not None:
+                if raw_thumb_cache:
+                    _annotated_cache_put(raw_thumb_key, data)
+                return _thumb_response(data)
         return _frame_file_response(str(raw_path))
+
     img = read_frame_bgr(
         video_name, frame_idx, OUTPUT_ROOT, video_path=resolved_vp,
     )
     if img is None:
         raise HTTPException(404, f"Frame {frame_idx} not found for {video_name}")
+    if want_w is not None:
+        data = _thumb_bytes(img, want_w)
+        if data is not None:
+            if raw_thumb_cache:
+                _annotated_cache_put(raw_thumb_key, data)
+            return _thumb_response(data)
     return _jpeg_response(img)
 
 
