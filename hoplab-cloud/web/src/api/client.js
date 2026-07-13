@@ -85,6 +85,51 @@ export async function listVideos() {
   return data.videos || [];
 }
 
+/**
+ * Sube un video al motor (multipart/form-data). Usa XHR para poder reportar
+ * el progreso de subida. Resuelve con la entrada JSON (misma forma que /api/videos).
+ *   uploadVideo(file, { subdir, onProgress })  ·  onProgress(pct 0..100)
+ */
+export function uploadVideo(file, { subdir = "", onProgress } = {}) {
+  return new Promise((resolve, reject) => {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("subdir", subdir || "");
+
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", absUrl("/api/upload"));
+
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable && onProgress) {
+        onProgress(Math.round((e.loaded / e.total) * 100));
+      }
+    };
+
+    xhr.onload = () => {
+      let data = {};
+      try {
+        data = JSON.parse(xhr.responseText || "{}");
+      } catch {
+        /* respuesta no-JSON */
+      }
+      if (xhr.status >= 200 && xhr.status < 300) {
+        onProgress?.(100);
+        resolve(data);
+      } else {
+        const detail = data.detail ?? data.error;
+        const message =
+          typeof detail === "string" ? detail : detail ? JSON.stringify(detail) : "";
+        reject(new Error(message || `Error al subir (HTTP ${xhr.status})`));
+      }
+    };
+
+    xhr.onerror = () => reject(new Error("No se pudo conectar con el motor"));
+    xhr.onabort = () => reject(new Error("Subida cancelada"));
+
+    xhr.send(form);
+  });
+}
+
 export async function getProject(videoPath, outputDir) {
   return fetchJson(apiUrl("/api/project", { video_path: videoPath, output_dir: outputDir }));
 }
@@ -135,6 +180,45 @@ export function mediaUrl(absPath) {
 
 export async function getCalibration(videoName) {
   return fetchJson(absUrl(`/api/calibration/${encodeURIComponent(videoName)}`));
+}
+
+/** Guarda calibration.json (geometría de pista) para un video. */
+export async function saveCalibration(videoName, calibration) {
+  return fetchJson(absUrl(`/api/calibration/${encodeURIComponent(videoName)}`), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(calibration),
+  });
+}
+
+/** Aprende colores de pista/arena desde la calibración + exporta dataset CNN. */
+export async function learnVenue({ videoName, videoPath, venueId, accumulate = true, samples } = {}) {
+  const body = { video_name: videoName };
+  if (videoPath) body.video_path = videoPath;
+  if (venueId) body.venue_id = venueId;
+  if (accumulate != null) body.accumulate = Boolean(accumulate);
+  if (samples) body.samples = samples;
+  return fetchJson(absUrl("/api/venue/learn"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+/** Reconstruye el dataset y entrena el CNN de venue. Devuelve { job_id, ... }. */
+export async function trainVenue({ videoName, videoPath, venueId, epochs, imgsz, model } = {}) {
+  const body = {};
+  if (videoName) body.video_name = videoName;
+  if (videoPath) body.video_path = videoPath;
+  if (venueId) body.venue_id = venueId;
+  if (epochs != null) body.epochs = Number(epochs);
+  if (imgsz != null) body.imgsz = Number(imgsz);
+  if (model) body.model = model;
+  return fetchJson(absUrl("/api/venue/train"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
 }
 
 export async function analyzeVideo({ videoPath, stride = 2, startSec = 0, endSec = null }) {

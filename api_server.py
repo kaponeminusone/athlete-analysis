@@ -42,6 +42,8 @@ Correr:
 
 import json
 import os
+import re
+import shutil
 import sys
 import threading
 import time
@@ -54,7 +56,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(__file__))
 
 try:
-    from fastapi import FastAPI, HTTPException, BackgroundTasks
+    from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Form
     from fastapi.responses import FileResponse, JSONResponse
     from fastapi.middleware.cors import CORSMiddleware
     from pydantic import BaseModel
@@ -1292,6 +1294,118 @@ def get_demo():
         raise HTTPException(404, "No demo analysis found in output/")
     demo_video = demo_analysis.parent.name + ".mp4"
     return JSONResponse(_project_payload(demo_video))
+
+
+UPLOAD_VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".m4v"}
+_UPLOAD_CHUNK = 1024 * 1024  # 1 MB
+
+
+def _sanitize_subdir(subdir: str) -> Path:
+    """Return a safe relative subfolder under VIDEO_ROOT (no traversal/absolute)."""
+    subdir = (subdir or "").strip().replace("\\", "/")
+    if not subdir:
+        return Path()
+    candidate = Path(subdir)
+    if candidate.is_absolute() or candidate.drive:
+        raise HTTPException(400, "subdir must be a relative path")
+    parts = []
+    for part in candidate.parts:
+        part = part.strip()
+        if part in ("", "."):
+            continue
+        if part == ".." or ":" in part:
+            raise HTTPException(400, "subdir must not contain '..' or drive references")
+        parts.append(part)
+    return Path(*parts) if parts else Path()
+
+
+def _sanitize_filename(filename: str) -> str:
+    """Keep basename only, strip unsafe chars, preserve the extension."""
+    base = os.path.basename((filename or "").replace("\\", "/")).strip()
+    stem, ext = os.path.splitext(base)
+    stem = re.sub(r"[^A-Za-z0-9._ -]+", "_", stem).strip(" .")
+    stem = re.sub(r"\s+", " ", stem)
+    if not stem:
+        stem = "video"
+    return f"{stem}{ext}"
+
+
+def _unique_path(directory: Path, filename: str) -> Path:
+    """Return a non-clobbering path, appending ' (1)', ' (2)', ... on collision."""
+    stem, ext = os.path.splitext(filename)
+    candidate = directory / filename
+    counter = 1
+    while candidate.exists():
+        candidate = directory / f"{stem} ({counter}){ext}"
+        counter += 1
+    return candidate
+
+
+@app.post("/api/upload")
+async def upload_video(file: UploadFile = File(...), subdir: str = Form("")):
+    """Accept an MP4/video upload and store it under VIDEO_ROOT[/subdir].
+
+    Returns the same shape as one /api/videos entry so the frontend can use
+    it directly.
+    """
+    if file is None or not file.filename:
+        raise HTTPException(400, "No file provided")
+
+    safe_name = _sanitize_filename(file.filename)
+    ext = os.path.splitext(safe_name)[1].lower()
+    if ext not in UPLOAD_VIDEO_EXTENSIONS:
+        raise HTTPException(
+            400,
+            f"Unsupported extension '{ext}'. Allowed: "
+            f"{', '.join(sorted(UPLOAD_VIDEO_EXTENSIONS))}",
+        )
+
+    target_dir = (VIDEO_ROOT / _sanitize_subdir(subdir)).resolve()
+    try:
+        # Drive shared paths may already exist; exist_ok handles that.
+        target_dir.mkdir(parents=True, exist_ok=True)
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        raise HTTPException(500, f"Could not create upload directory: {exc}")
+
+    dest = _unique_path(target_dir, safe_name)
+
+    bytes_written = 0
+    try:
+        with dest.open("wb") as out:
+            while True:
+                chunk = await file.read(_UPLOAD_CHUNK)
+                if not chunk:
+                    break
+                out.write(chunk)
+                bytes_written += len(chunk)
+    except OSError as exc:
+        try:
+            if dest.exists():
+                dest.unlink()
+        except OSError:
+            pass
+        raise HTTPException(500, f"Failed to write upload: {exc}")
+    finally:
+        await file.close()
+
+    if bytes_written == 0:
+        try:
+            dest.unlink()
+        except OSError:
+            pass
+        raise HTTPException(400, "Uploaded file is empty")
+
+    resolved = dest.resolve()
+    video_name = _video_name(str(resolved))
+    return JSONResponse({
+        "ok":         True,
+        "name":       resolved.name,
+        "path":       str(resolved),
+        "video_name": video_name,
+        "url":        _media_url(resolved),
+    })
 
 
 @app.get("/api/videos")

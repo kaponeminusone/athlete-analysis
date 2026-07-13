@@ -1,6 +1,32 @@
-import { useMemo, useState } from "react";
-import { CheckCircle2, CircleDashed, Play, Plus, Search, Upload, X } from "lucide-react";
+import { useMemo, useRef, useState } from "react";
+import {
+  AlertTriangle,
+  CheckCircle2,
+  CircleDashed,
+  FileVideo,
+  Loader2,
+  Play,
+  Plus,
+  Search,
+  Upload,
+  X,
+} from "lucide-react";
+import { uploadVideo } from "../api/client";
 import { ANALYSIS_LABEL, successPct, successTone } from "../mock/data";
+
+const ACCEPT_VIDEO = "video/mp4,video/quicktime,.mp4,.mov,.avi,.mkv,.m4v";
+
+function formatBytes(bytes) {
+  if (!bytes && bytes !== 0) return "";
+  const units = ["B", "KB", "MB", "GB"];
+  let value = bytes;
+  let i = 0;
+  while (value >= 1024 && i < units.length - 1) {
+    value /= 1024;
+    i += 1;
+  }
+  return `${value.toFixed(value >= 10 || i === 0 ? 0 : 1)} ${units[i]}`;
+}
 
 function Avatar({ athlete, size = "h-8 w-8", text = "text-xs" }) {
   return (
@@ -48,7 +74,7 @@ function StateChip({ analysis }) {
   );
 }
 
-function SessionCard({ athlete, session, onClick, toast }) {
+function SessionCard({ athlete, session, onClick, onAnalyze, toast }) {
   const pct = successPct(session);
   const tone = successTone(pct);
   return (
@@ -93,7 +119,14 @@ function SessionCard({ athlete, session, onClick, toast }) {
         {session.analysis === "none" && (
           <button
             type="button"
-            onClick={() => toast(`Análisis encolado para ${athlete.short} · ${session.date} (mock)`)}
+            onClick={() => {
+              const isApi = Boolean(session.videoPath || session.source === "api");
+              if (isApi) {
+                onAnalyze(athlete, session);
+              } else {
+                toast(`Sesión demo · sin motor para analizar ${athlete.short}`);
+              }
+            }}
             className="mt-1.5 inline-flex items-center gap-1 rounded-md bg-accent/15 px-2 py-1 text-[11px] font-semibold text-accent ring-1 ring-accent/30 transition hover:bg-accent/25"
           >
             <Play className="h-3 w-3 fill-current" /> Analizar
@@ -104,7 +137,7 @@ function SessionCard({ athlete, session, onClick, toast }) {
   );
 }
 
-function Row({ athlete, sessions, onOpenSession, toast }) {
+function Row({ athlete, sessions, onOpenSession, onAnalyze, toast }) {
   const best = useMemo(() => {
     const pcts = sessions.map((s) => successPct(s)).filter((p) => p != null);
     return pcts.length ? Math.max(...pcts) : null;
@@ -126,21 +159,60 @@ function Row({ athlete, sessions, onOpenSession, toast }) {
       </div>
       <div className="rail-scroll flex gap-3 overflow-x-auto px-6 pb-1">
         {sessions.map((s) => (
-          <SessionCard key={s.id} athlete={athlete} session={s} onClick={() => onOpenSession(athlete, s)} toast={toast} />
+          <SessionCard
+            key={s.id}
+            athlete={athlete}
+            session={s}
+            onClick={() => onOpenSession(athlete, s)}
+            onAnalyze={onAnalyze}
+            toast={toast}
+          />
         ))}
       </div>
     </section>
   );
 }
 
-function IngestModal({ athletes, onClose, toast }) {
-  const [athleteId, setAthleteId] = useState(athletes[0]?.id || "");
-  const [date, setDate] = useState("2026-07-11");
-  const [note, setNote] = useState("");
+function IngestModal({ connected, onClose, onUploaded, onConnectMotor, toast }) {
+  const [file, setFile] = useState(null);
+  const [dragOver, setDragOver] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [error, setError] = useState(null);
+  const inputRef = useRef(null);
+
+  function pickFile(f) {
+    if (!f) return;
+    setError(null);
+    setFile(f);
+  }
+
+  async function handleUpload() {
+    if (!file || uploading) return;
+    setUploading(true);
+    setError(null);
+    setProgress(0);
+    try {
+      const entry = await uploadVideo(file, {
+        onProgress: (pct) => setProgress(pct),
+      });
+      toast(`Video subido: ${entry.name || file.name}`);
+      onUploaded?.();
+      onClose();
+    } catch (err) {
+      setError(err.message || "Error al subir el video");
+      setUploading(false);
+    }
+  }
 
   return (
     <div className="fixed inset-0 z-[80] flex items-center justify-center p-4">
-      <button type="button" aria-label="Cerrar" className="absolute inset-0 bg-black/60" onClick={onClose} />
+      <button
+        type="button"
+        aria-label="Cerrar"
+        className="absolute inset-0 bg-black/60"
+        onClick={() => !uploading && onClose()}
+      />
       <div
         className="relative w-[min(460px,94%)] rounded-xl border border-border bg-surface p-5 shadow-2xl"
         style={{ animation: "slide-up 0.24s cubic-bezier(0.22,1,0.36,1) both" }}
@@ -150,70 +222,130 @@ function IngestModal({ athletes, onClose, toast }) {
             <Upload className="h-4 w-4 text-accent" />
             <p className="font-display text-sm font-semibold uppercase tracking-wide">Ingresar video</p>
           </div>
-          <button type="button" onClick={onClose} className="rounded-md p-1.5 text-muted hover:bg-elevated hover:text-text">
+          <button
+            type="button"
+            onClick={() => !uploading && onClose()}
+            disabled={uploading}
+            className="rounded-md p-1.5 text-muted hover:bg-elevated hover:text-text disabled:opacity-40"
+          >
             <X className="h-4 w-4" />
           </button>
         </div>
 
-        <div className="mb-3 flex items-center gap-3 rounded-lg border border-dashed border-border bg-elevated/40 px-3 py-4 text-sm text-muted">
-          <Upload className="h-4 w-4 shrink-0" />
-          salto_2026-07-11.mp4 · listo (mock)
-        </div>
+        {!connected ? (
+          <div className="flex flex-col items-center gap-3 rounded-lg border border-warn/30 bg-warn/5 px-4 py-6 text-center">
+            <AlertTriangle className="h-6 w-6 text-warn" />
+            <p className="text-sm text-muted">
+              Conectá el motor Colab antes de subir un video.
+            </p>
+            <button
+              type="button"
+              onClick={() => {
+                onClose();
+                onConnectMotor?.();
+              }}
+              className="rounded-md bg-accent px-4 py-2 text-sm font-semibold text-white transition hover:brightness-110"
+            >
+              Conectar motor
+            </button>
+          </div>
+        ) : (
+          <>
+            <input
+              ref={inputRef}
+              type="file"
+              accept={ACCEPT_VIDEO}
+              className="hidden"
+              onChange={(e) => pickFile(e.target.files?.[0])}
+            />
 
-        <label className="mb-1 block text-xs font-medium text-muted">Atleta</label>
-        <select
-          value={athleteId}
-          onChange={(e) => setAthleteId(e.target.value)}
-          className="mb-3 w-full rounded-md bg-elevated px-3 py-2 text-sm text-text outline-none ring-1 ring-border focus:ring-muted"
-        >
-          {athletes.map((a) => (
-            <option key={a.id} value={a.id}>
-              {a.name}
-            </option>
-          ))}
-        </select>
+            <button
+              type="button"
+              onClick={() => inputRef.current?.click()}
+              onDragOver={(e) => {
+                e.preventDefault();
+                setDragOver(true);
+              }}
+              onDragLeave={() => setDragOver(false)}
+              onDrop={(e) => {
+                e.preventDefault();
+                setDragOver(false);
+                pickFile(e.dataTransfer.files?.[0]);
+              }}
+              disabled={uploading}
+              className={`mb-3 flex w-full items-center gap-3 rounded-lg border border-dashed px-3 py-4 text-left text-sm transition ${
+                dragOver ? "border-accent bg-accent/10 text-text" : "border-border bg-elevated/40 text-muted hover:border-muted"
+              } disabled:opacity-60`}
+            >
+              {file ? <FileVideo className="h-5 w-5 shrink-0 text-accent" /> : <Upload className="h-4 w-4 shrink-0" />}
+              {file ? (
+                <span className="min-w-0">
+                  <span className="block truncate font-medium text-text">{file.name}</span>
+                  <span className="text-xs text-soft">{formatBytes(file.size)}</span>
+                </span>
+              ) : (
+                <span>Elegí o arrastrá un video (.mp4, .mov, .avi, .mkv, .m4v)</span>
+              )}
+            </button>
 
-        <label className="mb-1 block text-xs font-medium text-muted">Fecha</label>
-        <input
-          type="date"
-          value={date}
-          onChange={(e) => setDate(e.target.value)}
-          className="mb-3 w-full rounded-md bg-elevated px-3 py-2 text-sm text-text outline-none ring-1 ring-border focus:ring-muted"
-        />
+            {uploading && (
+              <div className="mb-3">
+                <div className="mb-1 flex justify-between text-xs text-muted">
+                  <span>Subiendo…</span>
+                  <span className="tabular-nums">{progress}%</span>
+                </div>
+                <div className="h-1.5 overflow-hidden rounded-full bg-elevated">
+                  <div
+                    className="h-full rounded-full bg-accent transition-[width] duration-200"
+                    style={{ width: `${progress}%` }}
+                  />
+                </div>
+              </div>
+            )}
 
-        <label className="mb-1 block text-xs font-medium text-muted">Nota</label>
-        <textarea
-          rows={2}
-          value={note}
-          onChange={(e) => setNote(e.target.value)}
-          placeholder="Ej.: foco en el aterrizaje…"
-          className="mb-4 w-full resize-none rounded-md bg-elevated px-3 py-2 text-sm text-text outline-none ring-1 ring-border placeholder:text-soft focus:ring-muted"
-        />
+            {error && (
+              <p className="mb-3 rounded-md bg-red-400/10 px-3 py-2 text-xs text-red-400">{error}</p>
+            )}
 
-        <div className="flex justify-end gap-2">
-          <button type="button" onClick={onClose} className="rounded-md px-4 py-2 text-sm text-muted hover:text-text">
-            Cancelar
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              const name = athletes.find((a) => a.id === athleteId)?.name;
-              toast(`Video asignado a ${name} · ${date} (mock)`);
-              onClose();
-            }}
-            className="rounded-md bg-accent px-4 py-2 text-sm font-semibold text-white transition hover:brightness-110"
-          >
-            Ingresar
-          </button>
-        </div>
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={onClose}
+                disabled={uploading}
+                className="rounded-md px-4 py-2 text-sm text-muted hover:text-text disabled:opacity-40"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                onClick={handleUpload}
+                disabled={!file || uploading}
+                className="inline-flex items-center gap-2 rounded-md bg-accent px-4 py-2 text-sm font-semibold text-white transition hover:brightness-110 disabled:opacity-50"
+              >
+                {uploading && <Loader2 className="h-4 w-4 animate-spin" />}
+                {uploading ? "Subiendo…" : error ? "Reintentar" : "Subir"}
+              </button>
+            </div>
+          </>
+        )}
       </div>
     </div>
   );
 }
 
-export default function LibraryHome({ athletes, onOpenSession, toast, loading = false, librarySource = "mock" }) {
+export default function LibraryHome({
+  athletes,
+  onOpenSession,
+  onAnalyzeSession,
+  onReloadLibrary,
+  onConnectMotor,
+  toast,
+  loading = false,
+  librarySource = "mock",
+}) {
   const [ingest, setIngest] = useState(false);
   const [query, setQuery] = useState("");
+  const connected = librarySource === "api";
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -283,10 +415,30 @@ export default function LibraryHome({ athletes, onOpenSession, toast, loading = 
             <p className="text-sm">Cargando biblioteca…</p>
           </div>
         ) : filtered.length === 0 ? (
-          <div className="flex h-full flex-col items-center justify-center gap-2 text-center text-muted">
-            <Search className="h-6 w-6 text-soft" />
-            <p className="text-sm">Sin resultados para “{query}”.</p>
-          </div>
+          query ? (
+            <div className="flex h-full flex-col items-center justify-center gap-2 text-center text-muted">
+              <Search className="h-6 w-6 text-soft" />
+              <p className="text-sm">Sin resultados para “{query}”.</p>
+            </div>
+          ) : connected ? (
+            <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center text-muted">
+              <FileVideo className="h-8 w-8 text-soft" />
+              <p className="text-sm">No hay videos. Subí uno con “Ingresar video”.</p>
+              <button
+                type="button"
+                onClick={() => setIngest(true)}
+                className="inline-flex items-center gap-1.5 rounded-md bg-accent px-3.5 py-2 text-sm font-semibold text-white shadow transition hover:brightness-110"
+              >
+                <Plus className="h-4 w-4" />
+                Ingresar video
+              </button>
+            </div>
+          ) : (
+            <div className="flex h-full flex-col items-center justify-center gap-2 px-6 text-center text-muted">
+              <Search className="h-6 w-6 text-soft" />
+              <p className="text-sm">Biblioteca vacía.</p>
+            </div>
+          )
         ) : (
           filtered.map((athlete) => (
             <Row
@@ -294,13 +446,22 @@ export default function LibraryHome({ athletes, onOpenSession, toast, loading = 
               athlete={athlete}
               sessions={athlete.sessions}
               onOpenSession={onOpenSession}
+              onAnalyze={onAnalyzeSession || onOpenSession}
               toast={toast}
             />
           ))
         )}
       </main>
 
-      {ingest && <IngestModal athletes={athletes} onClose={() => setIngest(false)} toast={toast} />}
+      {ingest && (
+        <IngestModal
+          connected={connected}
+          onClose={() => setIngest(false)}
+          onUploaded={onReloadLibrary}
+          onConnectMotor={onConnectMotor}
+          toast={toast}
+        />
+      )}
     </div>
   );
 }

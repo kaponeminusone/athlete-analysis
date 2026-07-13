@@ -36,6 +36,8 @@ hoplab-cloud/
 ┌─────────────────────────────┐
 │  Google Drive               │  videos/, output/, venues/, models/
 │  MyDrive/hoplab-data/       │  persiste entre sesiones
+│  (o carpeta compartida      │  invitados: HOPLAB_DATA_FOLDER_ID
+│   vía .shortcut-targets…)   │  → misma data del owner
 └─────────────────────────────┘
 ```
 
@@ -47,6 +49,8 @@ hoplab-cloud/
 4. Copiar la URL `https://….trycloudflare.com` en la UI (o pegarla en Vercel env y redeploy rápido / pantalla “conectar motor”).
 5. Usar HopLab desde el móvil/PC.
 6. Al terminar: Runtime → Disconnect (Drive ya guardó lo importante).
+
+**Invitado con Drive del owner:** el owner comparte `hoplab-data` (Editor) y pasa el ID de carpeta; el invitado pega `HOPLAB_DATA_FOLDER_ID` en la celda de config y hace Run All. Detalle en [`colab/README.md`](colab/README.md).
 
 ## Relación con el repo local
 

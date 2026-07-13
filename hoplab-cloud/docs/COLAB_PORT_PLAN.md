@@ -32,7 +32,7 @@ Referencias de patrón (ComfyUI / similares):
 | Pieza | Dónde vive | Rol |
 |-------|------------|-----|
 | **Motor ML** | Colab + código clonado del repo | `api_server.py`, jobs, frames |
-| **Datos** | Google Drive `MyDrive/hoplab-data/` | videos, output, venues, pesos |
+| **Datos** | Google Drive `MyDrive/hoplab-data/` (o carpeta compartida vía `HOPLAB_DATA_FOLDER_ID` → `.shortcut-targets-by-id/<ID>`) | videos, output, venues, pesos |
 | **Túnel** | cloudflared en el notebook | URL pública → `:8000` |
 | **UI** | Vercel/Render (`hoplab-cloud/web`) | Solo HTTP al túnel |
 
@@ -62,7 +62,7 @@ Al terminar el job, `output/` ya está en Drive → persiste. Mientras la sesió
 
 ```
 MyDrive/
-  hoplab-data/                 ← DATA_ROOT (persistente)
+  hoplab-data/                 ← DATA_ROOT owner (persistente; HOPLAB_DATA_FOLDER_ID="")
     videos/                    ← MP4 a analizar
     output/                    ← analysis, frames, _refined
     venues/                    ← CNN pista, profiles
@@ -70,6 +70,10 @@ MyDrive/
     logs/
   Colab Notebooks/
     HopLab_Server.ipynb        ← copia del notebook (o abrir desde GitHub)
+
+# Invitado (carpeta compartida del owner):
+/content/drive/.shortcut-targets-by-id/<HOPLAB_DATA_FOLDER_ID>/
+  ← mismo layout videos/, output/, venues/, models/, logs/
 ```
 
 Código del motor (opción A recomendada):

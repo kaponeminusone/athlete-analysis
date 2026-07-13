@@ -27,11 +27,13 @@ import {
   applyVenueMasks,
   computeMetrics,
   correctFrame,
+  getCalibration,
   getSections,
   movePhaseMarker,
   markPhase,
   pollJob,
   reanalyzeVideo,
+  saveCalibration,
   scaleMetrics,
 } from "../api/client";
 import { loadWatchSession, sessionSuccessPct } from "../api/mapSession";
@@ -164,7 +166,7 @@ function ChromeButton({ icon: Icon, label, active, disabled, disabledHint, tone 
   );
 }
 
-export default function WatchPage({ athlete, session, onBack, onSelectSession, onSessionPatched, toast }) {
+export default function WatchPage({ athlete, session, autoAnalyze = false, onBack, onSelectSession, onSessionPatched, toast }) {
   const isApi = Boolean(session?.videoPath || session?.source === "api");
 
   const mockData = useMemo(
@@ -198,6 +200,8 @@ export default function WatchPage({ athlete, session, onBack, onSelectSession, o
   const [brushCount, setBrushCount] = useState(0);
   const [pistaCount, setPistaCount] = useState(0);
   const [correcting, setCorrecting] = useState(false);
+  const [autoStart, setAutoStart] = useState(false);
+  const autoStartDone = useRef(false);
   const [config, setConfig] = useState({
     stride: 2,
     range: "all",
@@ -326,6 +330,21 @@ export default function WatchPage({ athlete, session, onBack, onSelectSession, o
     }, Math.round(1000 / fpsMock));
     return () => window.clearInterval(id);
   }, [playing, frameCount, fpsMock]);
+
+  // "Analizar" desde la biblioteca: abre panel y arranca el pipeline real una vez.
+  useEffect(() => {
+    if (loadState !== "ready" || !autoAnalyze || !isApi || autoStartDone.current) return;
+    autoStartDone.current = true;
+    if (data?.hasAnalysis) {
+      setSideTab("stats");
+      setSideOpen(true);
+    } else {
+      setSideTab("config");
+      setSideOpen(true);
+      setAutoStart(true);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loadState, autoAnalyze, isApi]);
 
   async function handleAnalyze(cfg, onProgress) {
     if (!session.videoPath) {
@@ -502,7 +521,7 @@ export default function WatchPage({ athlete, session, onBack, onSelectSession, o
     if (!payload?.mask) return;
 
     if (!isApi) {
-      toast("Corrección del atleta aplicada (mock)");
+      toast("Corrección del atleta aplicada (demo local)");
       brushRef.current?.clear();
       setActiveTool(null);
       return;
@@ -543,6 +562,57 @@ export default function WatchPage({ athlete, session, onBack, onSelectSession, o
   function clearTool() {
     if (activeTool === "brush") brushRef.current?.clear();
     else pistaRef.current?.clear();
+  }
+
+  /**
+   * Guarda el polígono de pista dibujado como keyframe de calibración.
+   * PistaDraw entrega puntos en % (0..100); la calibración usa coords
+   * normalizadas 0..1. TODO(payload): asumimos que el polígono es `track_polygon`
+   * del frame actual; se hace merge con los keyframes existentes.
+   */
+  async function submitPista(points) {
+    if (!isApi) {
+      toast("Editar pista: disponible solo con motor (API)");
+      return;
+    }
+    const videoName = data?.videoName || session.videoName;
+    if (!videoName || frame == null) {
+      toast("Sin video o frame para calibrar la pista");
+      return;
+    }
+    const poly = points.map((p) => [
+      Number((p.x / 100).toFixed(5)),
+      Number((p.y / 100).toFixed(5)),
+    ]);
+    const keyframe = { frame_idx: frame.frameId, track_polygon: poly, source: "manual" };
+
+    setCorrecting(true);
+    try {
+      let existing = null;
+      try {
+        existing = await getCalibration(videoName);
+      } catch {
+        existing = null;
+      }
+      const keyframes = Array.isArray(existing?.keyframes) ? [...existing.keyframes] : [];
+      const at = keyframes.findIndex((k) => k.frame_idx === frame.frameId);
+      if (at >= 0) keyframes[at] = { ...keyframes[at], ...keyframe };
+      else keyframes.push(keyframe);
+
+      await saveCalibration(videoName, {
+        version: existing?.version ?? 2,
+        video: existing?.video || `${baseVideoStem(videoName)}.mp4`,
+        keyframes,
+        mode: existing?.mode,
+        seeds: existing?.seeds,
+        propagation: existing?.propagation,
+      });
+      toast(`Pista guardada · frame ${frame.frameId} (${points.length} puntos)`);
+    } catch (err) {
+      toast(err.message || "Error al guardar la pista");
+    } finally {
+      setCorrecting(false);
+    }
   }
 
   function stepBack() {
@@ -827,7 +897,13 @@ export default function WatchPage({ athlete, session, onBack, onSelectSession, o
                 <AnnotationHUD frame={frame} visible={!playing || scrubPreview != null} />
 
                 <BrushLayer ref={brushRef} active={activeTool === "brush" && !correcting} onCountChange={setBrushCount} />
-                <PistaDraw ref={pistaRef} active={activeTool === "pista"} onCountChange={setPistaCount} toast={toast} />
+                <PistaDraw
+                  ref={pistaRef}
+                  active={activeTool === "pista"}
+                  onCountChange={setPistaCount}
+                  onAccept={submitPista}
+                  toast={toast}
+                />
               </MediaStage>
             </div>
 
@@ -905,6 +981,10 @@ export default function WatchPage({ athlete, session, onBack, onSelectSession, o
           hasAnalysis={hasAnalysis}
           successPct={successPct}
           apiEnabled={isApi}
+          videoName={data?.videoName || session.videoName}
+          videoPath={data?.videoPath || session.videoPath}
+          autoStart={autoStart}
+          onAutoStartConsumed={() => setAutoStart(false)}
           onAnalyze={isApi ? handleAnalyze : null}
           onApplyScale={isApi ? handleApplyScale : null}
           currentTimeSec={currentTimeSec}

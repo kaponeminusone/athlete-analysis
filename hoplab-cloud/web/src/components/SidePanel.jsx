@@ -1,5 +1,6 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AlertTriangle, X } from "lucide-react";
+import { learnVenue, pollJob, trainVenue } from "../api/client";
 import {
   deltaChip,
   formatTime,
@@ -79,6 +80,10 @@ export default function SidePanel({
   hasAnalysis,
   successPct,
   apiEnabled = false,
+  videoName = null,
+  videoPath = null,
+  autoStart = false,
+  onAutoStartConsumed,
   onAnalyze = null,
   onApplyScale = null,
   currentTimeSec = 0,
@@ -92,7 +97,10 @@ export default function SidePanel({
   const [progressMsg, setProgressMsg] = useState(null);
   const [lightbox, setLightbox] = useState(null);
   const [busyScale, setBusyScale] = useState(false);
+  const [busyLearn, setBusyLearn] = useState(false);
+  const [trainMsg, setTrainMsg] = useState(null);
   const timer = useRef(null);
+  const autoRan = useRef(false);
   const tone = successTone(successPct);
 
   async function analyze() {
@@ -155,6 +163,55 @@ export default function SidePanel({
       toast(err.message || "Error al escalar");
     } finally {
       setBusyScale(false);
+    }
+  }
+
+  // Auto-arranque del análisis (al llegar desde "Analizar" en la biblioteca).
+  useEffect(() => {
+    if (!autoStart || autoRan.current) return;
+    if (!onAnalyze || hasAnalysis || progress != null) return;
+    autoRan.current = true;
+    onAutoStartConsumed?.();
+    analyze();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoStart, onAnalyze, hasAnalysis]);
+
+  /** Aprende colores de pista/arena de este video (venue/learn, síncrono). */
+  async function learnVenueNow() {
+    if (busyLearn || !videoName) return;
+    setBusyLearn(true);
+    try {
+      const res = await learnVenue({ videoName, videoPath });
+      toast(
+        `Aprendido · ${res.frames_used ?? 0} frames · dataset ${res.total_dataset_frames ?? 0}`,
+      );
+    } catch (err) {
+      toast(err.message || "Error al aprender del video");
+    } finally {
+      setBusyLearn(false);
+    }
+  }
+
+  /** Entrena el CNN de venue (venue/train → job async con polling). */
+  async function trainVenueNow() {
+    if (trainMsg || !videoName) return;
+    setTrainMsg("Entrenando… 0%");
+    try {
+      const start = await trainVenue({ videoName, videoPath });
+      if (start.job_id) {
+        const job = await pollJob(start.job_id, {
+          onProgress: (j) =>
+            setTrainMsg(`${j.message || "Entrenando"} ${Math.round(j.percent || 0)}%`),
+          intervalMs: 1500,
+        });
+        toast(job.message || "Mapa entrenado");
+      } else {
+        toast("Entrenamiento iniciado");
+      }
+    } catch (err) {
+      toast(err.message || "Error al entrenar el mapa");
+    } finally {
+      setTrainMsg(null);
     }
   }
 
@@ -434,17 +491,27 @@ export default function SidePanel({
 
                     <button
                       type="button"
-                      onClick={() => toast("Aprender de este video (mock) — no ejecutado")}
-                      className="w-full rounded-md bg-elevated py-2 text-sm text-text ring-1 ring-border transition hover:ring-warn/50"
+                      onClick={() =>
+                        apiEnabled
+                          ? learnVenueNow()
+                          : toast("Aprender: disponible solo con motor (API)")
+                      }
+                      disabled={busyLearn || (apiEnabled && !videoName)}
+                      className="w-full rounded-md bg-elevated py-2 text-sm text-text ring-1 ring-border transition hover:ring-warn/50 disabled:opacity-60"
                     >
-                      Aprender de este video
+                      {busyLearn ? "Aprendiendo…" : "Aprender de este video"}
                     </button>
                     <button
                       type="button"
-                      onClick={() => toast("Entrenar mapa (mock) — no ejecutado")}
-                      className="w-full rounded-md bg-elevated py-2 text-sm text-text ring-1 ring-border transition hover:ring-warn/50"
+                      onClick={() =>
+                        apiEnabled
+                          ? trainVenueNow()
+                          : toast("Entrenar: disponible solo con motor (API)")
+                      }
+                      disabled={Boolean(trainMsg) || (apiEnabled && !videoName)}
+                      className="w-full rounded-md bg-elevated py-2 text-sm text-text ring-1 ring-border transition hover:ring-warn/50 disabled:opacity-60"
                     >
-                      Entrenar mapa
+                      {trainMsg || "Entrenar mapa"}
                     </button>
                   </div>
                 )}

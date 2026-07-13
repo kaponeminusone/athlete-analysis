@@ -24,21 +24,21 @@ export default function App() {
     window.setTimeout(() => setToastMsg(null), 2800);
   }, []);
 
-  /** Carga la biblioteca desde la API y actualiza el estado. */
+  /**
+   * Carga la biblioteca desde la API. Solo se llama con motor conectado, así que
+   * una lista vacía es un estado real (empty state), NO mock. El mock ATHLETES
+   * queda reservado para la vista previa sin motor.
+   */
   const loadLibrary = useCallback(async () => {
     setLibraryLoading(true);
     try {
-      const { athletes: apiAthletes, empty } = await loadLibraryFromApi();
-      if (empty || !apiAthletes.length) {
-        setAthletes(ATHLETES);
-        setLibrarySource("mock");
-      } else {
-        setAthletes(apiAthletes);
-        setLibrarySource("api");
-      }
+      const { athletes: apiAthletes } = await loadLibraryFromApi();
+      setAthletes(apiAthletes || []);
+      setLibrarySource("api");
     } catch {
-      setAthletes(ATHLETES);
-      setLibrarySource("mock");
+      // Motor conectado pero la API falló: mostrar biblioteca vacía real.
+      setAthletes([]);
+      setLibrarySource("api");
     } finally {
       setLibraryLoading(false);
     }
@@ -87,10 +87,18 @@ export default function App() {
     [loadLibrary, toast],
   );
 
-  const openSession = useCallback((athlete, sess) => {
-    setCurrent({ athlete, session: sess });
+  const openSession = useCallback((athlete, sess, opts = {}) => {
+    setCurrent({ athlete, session: sess, autoAnalyze: Boolean(opts.autoAnalyze) });
     setView("watch");
   }, []);
+
+  /** "Analizar" desde la biblioteca: abre WatchPage y arranca el pipeline real. */
+  const analyzeSession = useCallback(
+    (athlete, sess) => {
+      openSession(athlete, sess, { autoAnalyze: true });
+    },
+    [openSession],
+  );
 
   const selectSession = useCallback((sess) => {
     setCurrent((c) => (c ? { ...c, session: sess } : c));
@@ -131,6 +139,9 @@ export default function App() {
         <LibraryHome
           athletes={athletes}
           onOpenSession={openSession}
+          onAnalyzeSession={analyzeSession}
+          onReloadLibrary={loadLibrary}
+          onConnectMotor={() => setShowMotorConnect(true)}
           toast={toast}
           loading={libraryLoading}
           librarySource={librarySource}
@@ -141,6 +152,7 @@ export default function App() {
         <WatchPage
           athlete={current.athlete}
           session={current.session}
+          autoAnalyze={current.autoAnalyze}
           onBack={() => setView("library")}
           onSelectSession={selectSession}
           onSessionPatched={patchSession}

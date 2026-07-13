@@ -7,7 +7,7 @@ import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "re
  *   - tap = coloca un punto (vértice).
  *   - long-press + arrastrar = traza la polilínea en vivo (animada); soltar termina.
  */
-const PistaDraw = forwardRef(function PistaDraw({ active, onCountChange, toast }, ref) {
+const PistaDraw = forwardRef(function PistaDraw({ active, onCountChange, onAccept, toast }, ref) {
   const svgRef = useRef(null);
   const longPress = useRef(null);
   const mode = useRef("idle"); // idle | pending | dragging
@@ -33,7 +33,8 @@ const PistaDraw = forwardRef(function PistaDraw({ active, onCountChange, toast }
         toast("Colocá al menos 3 puntos para definir la pista");
         return false;
       }
-      toast(`Pista definida con ${points.length} puntos (mock)`);
+      // Envía el polígono al motor (calibración real); onAccept maneja sus toasts.
+      onAccept?.(points.map((p) => ({ x: p.x, y: p.y })));
       setPoints([]);
       setLive(null);
       mode.current = "idle";
