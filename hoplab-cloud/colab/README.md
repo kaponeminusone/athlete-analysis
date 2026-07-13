@@ -10,9 +10,9 @@ Notebook **Open in Colab** estilo ComfyUI.
 
 | Sección | Contenido |
 |---------|-----------|
-| **0. Configuración** | Repo, Drive, `HOPLAB_DATA_FOLDER_ID` (única celda a editar) |
+| **0. Configuración** | Repo, Drive, `HOPLAB_DATA_FOLDER_ID` / `HOPLAB_DATA_ROOT` (única celda a editar) |
 | **1. Solo owner** | Bootstrap Drive una vez (colapsar / omitir después) |
-| **2. Setup** | GPU → Drive → clone → install → env/symlinks |
+| **2. Setup** | GPU → Drive → (diagnóstico opcional) → clone → install → env/symlinks |
 | **3. Arrancar API** | uvicorn + logs en `DATA_ROOT/logs/hoplab-api.log` |
 | **4. Túnel + URL** | cloudflared + URL para Vercel (fallback localtunnel colapsable) |
 | **5. Terminal** | Panel HTML live (▶ debe quedar corriendo) — si no ves texto, la celda no se ejecutó |
@@ -36,36 +36,48 @@ Varias personas pueden **Run All** en Colab con su propia cuenta, pero leer/escr
 
 1. Ejecuta una vez el bootstrap («SOLO OWNER…» en el notebook o `owner_bootstrap_drive.py`): crea `hoplab-data` + subcarpetas e imprime el folder ID.
 2. Comparte esa carpeta con los emails de los invitados como **Editor**.
-3. Envía el ID impreso a los invitados (es el valor de `HOPLAB_DATA_FOLDER_ID`).
+3. Envía el enlace de Drive (o el ID) a los invitados.
 
-### Invitado (tercero)
+### Invitado (recomendado)
 
-1. Acepta la invitación de Drive (aparecerá en “Compartido conmigo”).
-2. Abre el notebook, Runtime → GPU.
-3. En la celda de configuración, pega el ID del owner:
+La ruta más fiable es un **acceso directo en Mi unidad** (FUSE escribe mejor que `.shortcut-targets-by-id`):
+
+1. Abre el enlace del share en Drive y acepta el acceso.
+2. En la carpeta: **Organizar → Añadir acceso directo a Mi unidad** (nombre típico: `hoplab-data`).
+3. En la celda de configuración del notebook:
    ```python
-   HOPLAB_DATA_FOLDER_ID = "FOLDER_ID_DEL_OWNER"
+   HOPLAB_DATA_FOLDER_ID = ""
+   HOPLAB_DATA_ROOT = "/content/drive/MyDrive/hoplab-data"
    ```
-4. Runtime → Run all (autoriza **tu** cuenta de Google para montar Drive; es obligatorio).
-5. Colab resuelve los datos en:
-   `/content/drive/.shortcut-targets-by-id/<FOLDER_ID>/`
-   (no en tu `MyDrive/hoplab-data` vacío).
-6. Pega la URL del túnel en la UI de Vercel (Conectar motor).
-7. Ejecutá la **Terminal** (sección 5, play ▶) y dejala corriendo; debe mostrar el panel HTML.
+   (ajusta la ruta si el acceso directo tiene otro nombre).
+4. Runtime → GPU → Run all (autoriza **tu** cuenta de Google).
+5. Si acabas de aceptar el share, remonta una vez:
+   `drive.mount('/content/drive', force_remount=True)`.
+6. Pega la URL del túnel en Vercel → Conectar motor y deja la **Terminal** (sección 5) corriendo.
 
-Si la ruta por ID no existe tras el mount: acepta el share, espera unos segundos y re-ejecuta la celda de Drive.
+### Invitado (alternativa: solo folder ID)
+
+Si no quieres (o no puedes) añadir el acceso directo:
+
+```python
+HOPLAB_DATA_FOLDER_ID = "FOLDER_ID_DEL_OWNER"
+HOPLAB_DATA_ROOT = ""
+```
+
+El notebook prueba, en orden:
+
+1. `HOPLAB_DATA_ROOT` (si está definido)
+2. `/content/drive/.shortcut-targets-by-id/<ID>/`
+3. `/content/drive/.shortcut-targets-by-id/<ID>/hoplab-data` (si compartieron el padre)
+4. `/content/drive/MyDrive/hoplab-data` y un glob de accesos directos con ese nombre
+
+Si ninguna ruta FUSE aparece: celda **Diagnóstico acceso Drive (invitado)** — distingue share no aceptado (API 403/404) vs API OK pero FUSE sin montar.
 
 ### errno 95 / `mkdir` en carpetas compartidas
 
 En `.shortcut-targets-by-id`, Drive FUSE a menudo **no permite crear carpetas** (`OSError: [Errno 95] Operation not supported`). El notebook intenta `mkdir` local y, si falla con `HOPLAB_DATA_FOLDER_ID` definido, **crea las subcarpetas vía Drive API v3** (`auth.authenticate_user()` — puede pedir consent la primera vez). Los invitados ya no necesitan que el owner pre-cree `videos/output/venues/models/logs` si tienen rol **Editor** en la carpeta.
 
 Si FUSE tarda en ver las carpetas nuevas, re-ejecuta la celda de Drive unos segundos después.
-
-**Alternativa (escrituras más fiables):** Organizar → «Añadir acceso directo a Mi unidad» y en la config:
-```python
-HOPLAB_DATA_ROOT = "/content/drive/MyDrive/hoplab-data"
-```
-Orden de resolución: `HOPLAB_DATA_ROOT` → `HOPLAB_DATA_FOLDER_ID` → `MyDrive/hoplab-data`.
 
 ## Archivos
 
