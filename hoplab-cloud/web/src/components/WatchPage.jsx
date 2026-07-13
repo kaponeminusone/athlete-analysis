@@ -22,6 +22,7 @@ import PistaDraw from "./PistaDraw";
 import SidePanel from "./SidePanel";
 import Timeline from "./Timeline";
 import {
+  absUrl,
   analyzeSections,
   analyzeVideo,
   applyVenueMasks,
@@ -29,6 +30,7 @@ import {
   correctFrame,
   getCalibration,
   getSections,
+  mediaUrl,
   movePhaseMarker,
   markPhase,
   pollJob,
@@ -215,13 +217,20 @@ export default function WatchPage({ athlete, session, autoAnalyze = false, onBac
   const pointerRef = useRef(null);
   const brushRef = useRef(null);
   const pistaRef = useRef(null);
+  const rawVideoRef = useRef(null);
   /** Conserva el frame actual al recargar tras una corrección. */
   const keepFrameIndexRef = useRef(null);
+  const [previewTimeSec, setPreviewTimeSec] = useState(0);
+  const [previewDurationSec, setPreviewDurationSec] = useState(null);
+  const [rawVideoError, setRawVideoError] = useState(false);
 
   // Nueva sesión → permitir otro autoAnalyze / autoStart.
   useEffect(() => {
     autoStartDone.current = false;
     setAutoStart(false);
+    setPreviewTimeSec(0);
+    setPreviewDurationSec(null);
+    setRawVideoError(false);
   }, [session.id]);
 
   const applyWatchData = useCallback((next) => {
@@ -731,11 +740,28 @@ export default function WatchPage({ athlete, session, autoAnalyze = false, onBac
 
   const displayIndex = scrubPreview ?? frameIndex;
   const frame = frames[displayIndex];
-  const currentTimeSec = frame?.timeMs != null ? frame.timeMs / 1000 : 0;
+  const rawVideoSrc = useMemo(() => {
+    const projectUrl = data?.project?.video?.url;
+    if (projectUrl) {
+      const u = String(projectUrl);
+      if (u.startsWith("http://") || u.startsWith("https://")) return u;
+      return absUrl(u.startsWith("/") ? u : `/${u}`);
+    }
+    const path = data?.videoPath || session?.videoPath;
+    return path ? mediaUrl(path) : "";
+  }, [data?.project?.video?.url, data?.videoPath, session?.videoPath]);
+
+  useEffect(() => {
+    setRawVideoError(false);
+    setPreviewTimeSec(0);
+    setPreviewDurationSec(null);
+  }, [rawVideoSrc]);
+
+  const currentTimeSec = frame?.timeMs != null ? frame.timeMs / 1000 : previewTimeSec;
   const durationSec =
     frames.length > 0 && frames[frames.length - 1]?.timeMs != null
       ? frames[frames.length - 1].timeMs / 1000
-      : data?.project?.video?.duration_s ?? null;
+      : data?.project?.video?.duration_s ?? previewDurationSec;
   const frameSrcRaw = frame ? (trackingOn ? frame.annotated : frame.raw) : "";
   const frameSrc = frameSrcRaw
     ? `${frameSrcRaw}${frameSrcRaw.includes("?") ? "&" : "?"}v=${reloadToken}`
@@ -848,7 +874,7 @@ export default function WatchPage({ athlete, session, autoAnalyze = false, onBac
             label="Seguimiento"
             active={trackingOn}
             disabled={!frame}
-            disabledHint="Sin frames — analizá primero"
+            disabledHint="Sin frames — analiza primero"
             onClick={() => setTrackingOn((v) => !v)}
           />
           <ChromeButton
@@ -856,7 +882,7 @@ export default function WatchPage({ athlete, session, autoAnalyze = false, onBac
             label="Pista"
             active={pistaOn}
             disabled={!hasMasks || !frame}
-            disabledHint={!frame ? "Sin frames — analizá primero" : "Sin mapa de pista"}
+            disabledHint={!frame ? "Sin frames — analiza primero" : "Sin mapa de pista"}
             onClick={() => setPistaOn((v) => !v)}
           />
           <span className="mx-0.5 h-5 w-px bg-border" />
@@ -866,7 +892,7 @@ export default function WatchPage({ athlete, session, autoAnalyze = false, onBac
             tone="cyan"
             active={activeTool === "brush"}
             disabled={!frame}
-            disabledHint="Sin frames — analizá primero"
+            disabledHint="Sin frames — analiza primero"
             onClick={() => toggleTool("brush")}
           />
           <ChromeButton
@@ -875,7 +901,7 @@ export default function WatchPage({ athlete, session, autoAnalyze = false, onBac
             tone="cyan"
             active={activeTool === "pista"}
             disabled={!frame}
-            disabledHint="Sin frames — analizá primero"
+            disabledHint="Sin frames — analiza primero"
             onClick={() => toggleTool("pista")}
           />
           <span className="mx-0.5 h-5 w-px bg-border" />
@@ -910,9 +936,11 @@ export default function WatchPage({ athlete, session, autoAnalyze = false, onBac
         >
           <div aria-hidden className="min-w-0 overflow-hidden" />
           <div
-            className="no-select relative flex min-h-0 min-w-0 touch-none select-none items-center justify-center p-2 sm:p-3"
-            onSelectStart={(e) => e.preventDefault()}
-            onDragStart={(e) => e.preventDefault()}
+            className={`relative flex min-h-0 min-w-0 select-none items-center justify-center p-2 sm:p-3 ${
+              frame ? "no-select touch-none" : ""
+            }`}
+            onSelectStart={frame ? (e) => e.preventDefault() : undefined}
+            onDragStart={frame ? (e) => e.preventDefault() : undefined}
             onPointerDown={frame ? onStagePointerDown : undefined}
             onPointerMove={frame ? onStagePointerMove : undefined}
             onPointerUp={frame ? onStagePointerUp : undefined}
@@ -942,12 +970,71 @@ export default function WatchPage({ athlete, session, autoAnalyze = false, onBac
                     toast={toast}
                   />
                 </MediaStage>
+              ) : rawVideoSrc ? (
+                <div className="relative h-full w-full overflow-hidden rounded-lg bg-black ring-1 ring-white/10">
+                  <video
+                    ref={rawVideoRef}
+                    key={rawVideoSrc}
+                    controls
+                    playsInline
+                    preload="metadata"
+                    src={rawVideoSrc}
+                    className="absolute inset-0 h-full w-full object-contain"
+                    onLoadedMetadata={(e) => {
+                      const d = e.currentTarget.duration;
+                      if (Number.isFinite(d) && d > 0) setPreviewDurationSec(d);
+                      setPreviewTimeSec(e.currentTarget.currentTime || 0);
+                      setRawVideoError(false);
+                    }}
+                    onTimeUpdate={(e) => {
+                      setPreviewTimeSec(e.currentTarget.currentTime || 0);
+                    }}
+                    onError={() => setRawVideoError(true)}
+                  />
+                  <div className="pointer-events-none absolute inset-x-0 top-0 z-10 bg-black/70 px-3 py-2.5 backdrop-blur-[2px]">
+                    <div className="pointer-events-auto mx-auto flex max-w-xl flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-3">
+                      <div className="min-w-0 text-left">
+                        <p className="text-sm font-medium text-text">Sin análisis todavía</p>
+                        <p className="mt-0.5 text-[11px] leading-snug text-muted">
+                          Reproduce el video para elegir el rango de análisis (inicio/fin) en el panel. Luego
+                          configura y pulsa Analizar.
+                        </p>
+                        {rawVideoError && (
+                          <p className="mt-1 text-[11px] text-warn">
+                            No se pudo cargar el video desde el motor. Revisa la URL del túnel.
+                          </p>
+                        )}
+                      </div>
+                      <div className="flex shrink-0 flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          data-chrome
+                          onClick={() => {
+                            setSideTab("config");
+                            setSideOpen(true);
+                            setAutoStart(true);
+                          }}
+                          className="rounded-md bg-accent px-3 py-1.5 text-xs font-semibold text-white"
+                        >
+                          Analizar ahora
+                        </button>
+                        <button
+                          type="button"
+                          data-chrome
+                          onClick={() => openPanel("config")}
+                          className="rounded-md bg-elevated px-3 py-1.5 text-xs font-semibold text-text ring-1 ring-border"
+                        >
+                          Abrir configuración
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
               ) : (
                 <div className="flex h-full w-full flex-col items-center justify-center gap-3 rounded-lg bg-black/80 px-6 text-center ring-1 ring-white/10">
-                  <p className="text-sm font-medium text-text">Video sin frames aún</p>
+                  <p className="text-sm font-medium text-text">Sin análisis todavía</p>
                   <p className="max-w-sm text-xs text-muted">
-                    Este clip todavía no tiene análisis. Pulsá Analizar para arrancar el pipeline, o abrí
-                    Configuración para ajustar stride / rango.
+                    Configura el rango y pulsa Analizar, o abre Configuración para ajustar stride / rango.
                   </p>
                   <div className="flex flex-wrap items-center justify-center gap-2">
                     <button
@@ -1007,8 +1094,8 @@ export default function WatchPage({ athlete, session, autoAnalyze = false, onBac
             {toolActive && (
               <div className="pointer-events-none absolute bottom-3 left-1/2 z-30 -translate-x-1/2 rounded-full bg-black/70 px-3 py-1.5 text-[11px] text-muted ring-1 ring-white/10">
                 {activeTool === "brush"
-                  ? "Pintá sobre el atleta · Aceptar / Limpiar arriba"
-                  : "Tap = punto · mantené y arrastrá = trazar · Aceptar arriba"}
+                  ? "Pinta sobre el atleta · Aceptar / Limpiar arriba"
+                  : "Tap = punto · mantén y arrastra = trazar · Aceptar arriba"}
               </div>
             )}
 
@@ -1084,7 +1171,7 @@ export default function WatchPage({ athlete, session, autoAnalyze = false, onBac
         />
       ) : (
         <div className="shrink-0 border-t border-border bg-surface/95 px-4 py-3 text-center text-xs text-muted">
-          Sin timeline hasta que termine el análisis
+          Vista previa del video · el timeline de fases aparece tras el análisis
         </div>
       )}
     </div>

@@ -195,7 +195,7 @@ export default function Timeline({
                 hiding ? "opacity-30" : ""
               }`}
               style={{ left: pct(c.index), backgroundColor: color, boxShadow: `0 2px 8px ${color}66` }}
-              title={`${c.label} · frame ${c.frameId} · mantené para mover`}
+              title={`${c.label} · frame ${c.frameId} · mantén para mover`}
             >
               {c.label}
             </button>

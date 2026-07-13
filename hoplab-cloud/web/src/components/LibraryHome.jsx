@@ -238,7 +238,7 @@ function IngestModal({ connected, onClose, onUploaded, onConnectMotor, toast }) 
           <div className="flex flex-col items-center gap-3 rounded-lg border border-warn/30 bg-warn/5 px-4 py-6 text-center">
             <AlertTriangle className="h-6 w-6 text-warn" />
             <p className="text-sm text-muted">
-              Conectá el motor Colab antes de subir un video.
+              Conecta el motor Colab antes de subir un video.
             </p>
             <button
               type="button"
@@ -286,7 +286,7 @@ function IngestModal({ connected, onClose, onUploaded, onConnectMotor, toast }) 
                   <span className="text-xs text-soft">{formatBytes(file.size)}</span>
                 </span>
               ) : (
-                <span>Elegí o arrastrá un video (.mp4, .mov, .avi, .mkv, .m4v)</span>
+                <span>Elige o arrastra un video (.mp4, .mov, .avi, .mkv, .m4v)</span>
               )}
             </button>
 
@@ -425,7 +425,7 @@ export default function LibraryHome({
           ) : connected ? (
             <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center text-muted">
               <FileVideo className="h-8 w-8 text-soft" />
-              <p className="text-sm">No hay videos. Subí uno con “Ingresar video”.</p>
+              <p className="text-sm">No hay videos. Sube uno con “Ingresar video”.</p>
               <button
                 type="button"
                 onClick={() => setIngest(true)}

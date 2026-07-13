@@ -30,7 +30,7 @@ const PistaDraw = forwardRef(function PistaDraw({ active, onCountChange, onAccep
     },
     accept() {
       if (points.length < 3) {
-        toast("Colocá al menos 3 puntos para definir la pista");
+        toast("Coloca al menos 3 puntos para definir la pista");
         return false;
       }
       // Envía el polígono al motor (calibración real); onAccept maneja sus toasts.

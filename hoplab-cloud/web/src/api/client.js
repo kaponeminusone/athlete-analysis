@@ -17,7 +17,7 @@ export function getApiBase() {
   return buildTime.replace(/\/$/, "");
 }
 
-function absUrl(path) {
+export function absUrl(path) {
   const base = getApiBase();
   return base ? `${base}${path}` : path;
 }

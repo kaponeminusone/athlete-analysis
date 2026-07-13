@@ -579,7 +579,7 @@ export default function SidePanel({
 
                 <div>
                   <p className="mb-2 text-xs font-semibold uppercase tracking-wider text-soft">
-                    Hops · tocá para ir al frame
+                    Hops · toca para ir al frame
                   </p>
                   <div className="space-y-2.5">
                     {metrics.hops?.map((h) => {
