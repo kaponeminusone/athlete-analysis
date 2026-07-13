@@ -77,6 +77,11 @@ from src.pipeline         import PipelineConfig, run_pipeline
 from src.job_store        import create_job, get_job, list_jobs
 from src.reanalyzer       import ReanalysisConfig, run_reanalysis
 from src.schemas          import frame_analysis_to_dict, frame_record_to_analysis
+from src.video_meta       import (
+    read_video_meta as _read_video_meta,
+    sanitize_athlete_id as _sanitize_athlete_id,
+    write_video_meta as _write_video_meta,
+)
 from src.calibration      import (
     default_calibration,
     has_seeds,
@@ -1411,9 +1416,35 @@ def _unique_path(directory: Path, filename: str) -> Path:
     return candidate
 
 
+def _athlete_id_from_analysis(video_name: str) -> Optional[str]:
+    """Fallback athlete_id from sections.json or metrics.json when no sidecar."""
+    for fname in ("sections.json", "metrics.json"):
+        path = OUTPUT_ROOT / video_name / fname
+        if not path.is_file():
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            aid = (data or {}).get("athlete_id") if isinstance(data, dict) else None
+            if isinstance(aid, str) and aid.strip():
+                return aid.strip()
+        except (OSError, json.JSONDecodeError):
+            continue
+    return None
+
+
 @app.post("/api/upload")
-async def upload_video(file: UploadFile = File(...), subdir: str = Form("")):
+async def upload_video(
+    file: UploadFile = File(...),
+    subdir: str = Form(""),
+    athlete_id: str = Form(""),
+    note: str = Form(""),
+    date: str = Form(""),
+):
     """Accept an MP4/video upload and store it under VIDEO_ROOT[/subdir].
+
+    Optional Form fields athlete_id / note / date write a sibling .meta.json
+    sidecar so the library can group unanalyzed videos by athlete.
 
     Returns the same shape as one /api/videos entry so the frontend can use
     it directly.
@@ -1429,6 +1460,10 @@ async def upload_video(file: UploadFile = File(...), subdir: str = Form("")):
             f"Unsupported extension '{ext}'. Allowed: "
             f"{', '.join(sorted(UPLOAD_VIDEO_EXTENSIONS))}",
         )
+
+    clean_athlete = _sanitize_athlete_id(athlete_id)
+    clean_note = (note or "").strip() or None
+    clean_date = (date or "").strip() or None
 
     target_dir = (VIDEO_ROOT / _sanitize_subdir(subdir)).resolve()
     try:
@@ -1469,13 +1504,26 @@ async def upload_video(file: UploadFile = File(...), subdir: str = Form("")):
 
     resolved = dest.resolve()
     video_name = _video_name(str(resolved))
-    return JSONResponse({
+
+    if clean_athlete:
+        try:
+            _write_video_meta(resolved, clean_athlete, note=clean_note, date=clean_date)
+        except OSError as exc:
+            raise HTTPException(500, f"Video saved but failed to write meta: {exc}")
+
+    payload = {
         "ok":         True,
         "name":       resolved.name,
         "path":       str(resolved),
         "video_name": video_name,
         "url":        _media_url(resolved),
-    })
+        "athlete_id": clean_athlete or None,
+    }
+    if clean_note:
+        payload["note"] = clean_note
+    if clean_date:
+        payload["date"] = clean_date
+    return JSONResponse(payload)
 
 
 @app.get("/api/videos")
@@ -1487,21 +1535,49 @@ def list_videos():
             continue
         if any(part in ignored_parts for part in path.parts):
             continue
+        # Skip sidecar / non-video companions that share VIDEO_EXTENSIONS somehow
+        if path.name.endswith(".meta.json"):
+            continue
         resolved = path.resolve()
         video_name = _video_name(str(resolved))
         analysis_path  = OUTPUT_ROOT / video_name / "analysis.json"
         refined_dir    = OUTPUT_ROOT / f"{video_name}_refined"
         refined_path   = refined_dir / "analysis.json"
-        videos.append({
+        has_analysis = analysis_path.exists()
+
+        athlete_id = None
+        note = None
+        date = None
+        meta = _read_video_meta(resolved)
+        if meta:
+            aid = meta.get("athlete_id")
+            if isinstance(aid, str) and aid.strip():
+                athlete_id = aid.strip()
+            n = meta.get("note")
+            if isinstance(n, str) and n.strip():
+                note = n.strip()
+            d = meta.get("date")
+            if isinstance(d, str) and d.strip():
+                date = d.strip()
+        elif has_analysis:
+            athlete_id = _athlete_id_from_analysis(video_name)
+
+        entry = {
             "name":             path.name,
             "path":             str(resolved),
             "video_name":       video_name,
             "duration_s":       _video_duration(resolved),
-            "has_analysis":     analysis_path.exists(),
+            "has_analysis":     has_analysis,
             "has_refined":      refined_path.exists(),
             "refined_output_dir": str(refined_dir.resolve()) if refined_path.exists() else None,
             "url":              _media_url(resolved),
-        })
+            "athlete_id":       athlete_id,
+        }
+        if note:
+            entry["note"] = note
+        if date:
+            entry["date"] = date
+        videos.append(entry)
     videos.sort(key=lambda item: (not item["has_analysis"], item["name"].lower()))
     return {"videos": videos}
 

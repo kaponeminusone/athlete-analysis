@@ -88,13 +88,16 @@ export async function listVideos() {
 /**
  * Sube un video al motor (multipart/form-data). Usa XHR para poder reportar
  * el progreso de subida. Resuelve con la entrada JSON (misma forma que /api/videos).
- *   uploadVideo(file, { subdir, onProgress })  ·  onProgress(pct 0..100)
+ *   uploadVideo(file, { subdir, athleteId, note, date, onProgress })  ·  onProgress(pct 0..100)
  */
-export function uploadVideo(file, { subdir = "", onProgress } = {}) {
+export function uploadVideo(file, { subdir = "", athleteId, note, date, onProgress } = {}) {
   return new Promise((resolve, reject) => {
     const form = new FormData();
     form.append("file", file);
     form.append("subdir", subdir || "");
+    if (athleteId) form.append("athlete_id", athleteId);
+    if (note) form.append("note", note);
+    if (date) form.append("date", date);
 
     const xhr = new XMLHttpRequest();
     xhr.open("POST", absUrl("/api/upload"));

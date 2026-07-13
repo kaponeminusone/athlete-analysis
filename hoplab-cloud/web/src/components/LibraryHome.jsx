@@ -175,12 +175,20 @@ function Row({ athlete, sessions, onOpenSession, onAnalyze, toast }) {
   );
 }
 
-function IngestModal({ connected, onClose, onUploaded, onConnectMotor, toast }) {
+function IngestModal({ athletes = [], connected, onClose, onUploaded, onConnectMotor, toast }) {
+  const athleteOptions = useMemo(
+    () => (athletes || []).filter((a) => a.id !== "sin-asignar"),
+    [athletes],
+  );
   const [file, setFile] = useState(null);
   const [dragOver, setDragOver] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState(null);
+  const [athleteChoice, setAthleteChoice] = useState(""); // "" = Sin asignar, "__new__" = nuevo
+  const [newAthleteName, setNewAthleteName] = useState("");
+  const [note, setNote] = useState("");
+  const [date, setDate] = useState("");
   const inputRef = useRef(null);
 
   function pickFile(f) {
@@ -189,16 +197,32 @@ function IngestModal({ connected, onClose, onUploaded, onConnectMotor, toast }) 
     setFile(f);
   }
 
+  function resolveAthleteId() {
+    if (athleteChoice === "__new__") return newAthleteName.trim();
+    if (!athleteChoice) return "";
+    const found = athleteOptions.find((a) => a.id === athleteChoice);
+    return (found?.name || athleteChoice).trim();
+  }
+
   async function handleUpload() {
     if (!file || uploading) return;
+    const athleteId = resolveAthleteId();
+    if (athleteChoice === "__new__" && !athleteId) {
+      setError("Escribe el nombre del nuevo atleta, o elige Sin asignar.");
+      return;
+    }
     setUploading(true);
     setError(null);
     setProgress(0);
     try {
       const entry = await uploadVideo(file, {
+        athleteId: athleteId || undefined,
+        note: note.trim() || undefined,
+        date: date.trim() || undefined,
         onProgress: (pct) => setProgress(pct),
       });
-      toast(`Video subido: ${entry.name || file.name}`);
+      const label = entry.athlete_id || athleteId || "Sin asignar";
+      toast(`Video subido: ${entry.name || file.name} · ${label}`);
       onUploaded?.();
       onClose();
     } catch (err) {
@@ -290,6 +314,52 @@ function IngestModal({ connected, onClose, onUploaded, onConnectMotor, toast }) 
               )}
             </button>
 
+            <label className="mb-1 block text-xs font-medium text-muted">Atleta</label>
+            <select
+              value={athleteChoice}
+              onChange={(e) => setAthleteChoice(e.target.value)}
+              disabled={uploading}
+              className="mb-2 w-full rounded-md bg-elevated px-3 py-2 text-sm text-text outline-none ring-1 ring-border focus:ring-muted disabled:opacity-60"
+            >
+              <option value="">Sin asignar</option>
+              {athleteOptions.map((a) => (
+                <option key={a.id} value={a.id}>
+                  {a.name}
+                </option>
+              ))}
+              <option value="__new__">Nuevo atleta…</option>
+            </select>
+
+            {athleteChoice === "__new__" && (
+              <input
+                type="text"
+                value={newAthleteName}
+                onChange={(e) => setNewAthleteName(e.target.value)}
+                disabled={uploading}
+                placeholder="Nombre del atleta"
+                className="mb-3 w-full rounded-md bg-elevated px-3 py-2 text-sm text-text outline-none ring-1 ring-border placeholder:text-soft focus:ring-muted disabled:opacity-60"
+              />
+            )}
+
+            <label className="mb-1 block text-xs font-medium text-muted">Fecha (opcional)</label>
+            <input
+              type="date"
+              value={date}
+              onChange={(e) => setDate(e.target.value)}
+              disabled={uploading}
+              className="mb-3 w-full rounded-md bg-elevated px-3 py-2 text-sm text-text outline-none ring-1 ring-border focus:ring-muted disabled:opacity-60"
+            />
+
+            <label className="mb-1 block text-xs font-medium text-muted">Nota (opcional)</label>
+            <textarea
+              rows={2}
+              value={note}
+              onChange={(e) => setNote(e.target.value)}
+              disabled={uploading}
+              placeholder="Ej.: foco en el aterrizaje…"
+              className="mb-3 w-full resize-none rounded-md bg-elevated px-3 py-2 text-sm text-text outline-none ring-1 ring-border placeholder:text-soft focus:ring-muted disabled:opacity-60"
+            />
+
             {uploading && (
               <div className="mb-3">
                 <div className="mb-1 flex justify-between text-xs text-muted">
@@ -347,12 +417,32 @@ export default function LibraryHome({
 }) {
   const [ingest, setIngest] = useState(false);
   const [query, setQuery] = useState("");
+  const [athleteFilter, setAthleteFilter] = useState("todos");
   const connected = librarySource === "api";
 
+  const filterChips = useMemo(() => {
+    const chips = [
+      { id: "todos", label: "Todos" },
+      { id: "sin-asignar", label: "Sin asignar" },
+    ];
+    for (const a of athletes || []) {
+      if (a.id === "sin-asignar") continue;
+      chips.push({ id: a.id, label: a.short || a.name });
+    }
+    return chips;
+  }, [athletes]);
+
   const filtered = useMemo(() => {
+    let list = athletes || [];
+    if (athleteFilter === "sin-asignar") {
+      list = list.filter((a) => a.id === "sin-asignar");
+    } else if (athleteFilter !== "todos") {
+      list = list.filter((a) => a.id === athleteFilter);
+    }
+
     const q = query.trim().toLowerCase();
-    if (!q) return athletes;
-    return athletes
+    if (!q) return list;
+    return list
       .map((a) => {
         const athleteMatch = a.name.toLowerCase().includes(q);
         const sessions = athleteMatch
@@ -367,7 +457,7 @@ export default function LibraryHome({
         return { ...a, sessions };
       })
       .filter((a) => a.sessions.length > 0);
-  }, [athletes, query]);
+  }, [athletes, query, athleteFilter]);
 
   return (
     <div className="flex h-full flex-col bg-bg">
@@ -410,6 +500,28 @@ export default function LibraryHome({
         </button>
       </header>
 
+      {!loading && athletes.length > 0 && (
+        <div className="flex shrink-0 flex-wrap items-center gap-1.5 border-b border-border/60 px-6 py-2">
+          {filterChips.map((chip) => {
+            const active = athleteFilter === chip.id;
+            return (
+              <button
+                key={chip.id}
+                type="button"
+                onClick={() => setAthleteFilter(chip.id)}
+                className={`rounded-full px-2.5 py-1 text-[11px] font-semibold transition ring-1 ${
+                  active
+                    ? "bg-accent/20 text-accent ring-accent/40"
+                    : "bg-elevated/60 text-muted ring-border hover:text-text"
+                }`}
+              >
+                {chip.label}
+              </button>
+            );
+          })}
+        </div>
+      )}
+
       <main className="rail-scroll min-h-0 flex-1 overflow-y-auto py-5">
         {loading ? (
           <div className="flex h-full flex-col items-center justify-center gap-2 text-muted">
@@ -417,10 +529,12 @@ export default function LibraryHome({
             <p className="text-sm">Cargando biblioteca…</p>
           </div>
         ) : filtered.length === 0 ? (
-          query ? (
+          query || athleteFilter !== "todos" ? (
             <div className="flex h-full flex-col items-center justify-center gap-2 text-center text-muted">
               <Search className="h-6 w-6 text-soft" />
-              <p className="text-sm">Sin resultados para “{query}”.</p>
+              <p className="text-sm">
+                {query ? `Sin resultados para “${query}”.` : "Sin videos para este filtro."}
+              </p>
             </div>
           ) : connected ? (
             <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center text-muted">
@@ -457,6 +571,7 @@ export default function LibraryHome({
 
       {ingest && (
         <IngestModal
+          athletes={athletes}
           connected={connected}
           onClose={() => setIngest(false)}
           onUploaded={onReloadLibrary}

@@ -378,7 +378,9 @@ export async function loadWatchSession(session) {
 }
 
 /**
- * Lista videos de la API y agrupa por atleta (metrics.athlete_id) o "Sin asignar".
+ * Lista videos de la API y agrupa por atleta.
+ * Prefer athlete_id del listado (/api/videos sidecar o fallback) aunque no haya análisis;
+ * metrics/sections pueden enriquecer/override tras análisis.
  */
 export async function loadLibraryFromApi() {
   const videos = await listVideos();
@@ -389,14 +391,25 @@ export async function loadLibraryFromApi() {
   const enriched = await Promise.all(
     videos.map(async (v) => {
       const apiName = v.has_refined ? `${v.video_name}_refined` : v.video_name;
+      const listAthlete = (typeof v.athlete_id === "string" && v.athlete_id.trim())
+        ? v.athlete_id.trim()
+        : null;
+      const listNote = (typeof v.note === "string" && v.note.trim()) ? v.note.trim() : null;
+      const listDate = (typeof v.date === "string" && v.date.trim()) ? v.date.trim() : "";
       const base = {
         id: v.video_name,
         videoName: apiName,
         videoPath: v.path,
         outputDir: v.has_refined ? v.refined_output_dir : undefined,
         title: (v.name || v.video_name || "").replace(/\.[^.]+$/, ""),
-        date: "",
-        note: v.has_refined ? "Versión refinada disponible" : v.has_analysis ? "Con análisis" : "Pendiente de procesar",
+        date: listDate,
+        note:
+          listNote ||
+          (v.has_refined
+            ? "Versión refinada disponible"
+            : v.has_analysis
+              ? "Con análisis"
+              : "Pendiente de procesar"),
         durationLabel: formatDurationLabel(v.duration_s),
         // Siempre URL absoluta vía getApiBase(); sin analysis, /frame decodifica el MP4.
         thumb: frameUrl(v.video_name, 0, {
@@ -406,8 +419,8 @@ export async function loadLibraryFromApi() {
         analysis: v.has_analysis ? "partial" : "none",
         poseQualities: [],
         successPct: null,
-        athleteId: null,
-        athleteName: null,
+        athleteId: listAthlete,
+        athleteName: listAthlete,
         source: "api",
       };
 
@@ -440,7 +453,7 @@ export async function loadLibraryFromApi() {
           }
         }
 
-        base.athleteId = metrics?.athlete_id || sections?.athlete_id || null;
+        base.athleteId = metrics?.athlete_id || sections?.athlete_id || listAthlete || null;
         base.athleteName = base.athleteId || null;
         base.successPct = successPctFromMetrics(metrics);
         const pq = metrics?.comparison?.pose_quality?.hops || [];
