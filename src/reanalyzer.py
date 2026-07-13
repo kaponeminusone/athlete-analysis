@@ -735,6 +735,64 @@ def _copy_venue_assets_for_sections(original_dir: Path, refined_dir: Path) -> No
         print(f"  [Reanalyzer v2] Copied venue_masks/ → {refined_dir.name}/")
 
 
+def _reapply_venue_masks_for_refined(
+    refined_dir: Path,
+    video_path: Path,
+) -> bool:
+    """
+    Re-run venue mask apply on the refined output so every refined analysis
+    frame gets a mask PNG (first-pass copy is sparse when strides differ).
+
+    Mirrors /api/venue/apply use_masks gating. Returns True if apply ran.
+    Raises on hard failures — caller should soft-fail and keep copied masks.
+    """
+    from .venue_masks import should_use_keyframe_pipeline
+    from .venue_profile import (
+        DEFAULT_VENUE_ID,
+        apply_masks_to_output,
+        load_profile,
+    )
+    from .venue_seg_infer import has_trained_seg_model
+
+    refined_dir = Path(refined_dir)
+    video_path = Path(video_path)
+    cal_existing = load_calibration(refined_dir)
+
+    venue_id = DEFAULT_VENUE_ID
+    if cal_existing:
+        vp = cal_existing.get("venue_profile") or {}
+        if vp.get("venue_id"):
+            venue_id = str(vp["venue_id"])
+
+    use_cnn = has_trained_seg_model(venue_id)
+    use_keyframe_pipeline = (
+        not use_cnn
+        and cal_existing is not None
+        and should_use_keyframe_pipeline(cal_existing, prefer_keyframes=True)
+    )
+    profile = load_profile(venue_id)
+    use_masks = (
+        use_cnn
+        or use_keyframe_pipeline
+        or (profile is not None and int(profile.get("version", 2)) >= 3)
+    )
+    if not use_masks:
+        print(
+            "  [Reanalyzer v2] venue_masks: skip re-apply "
+            "(no CNN / keyframes / profile v3)"
+        )
+        return False
+
+    apply_masks_to_output(
+        refined_dir,
+        video_path,
+        profile=profile,
+        venue_id=venue_id,
+        prefer_keyframes=True,
+    )
+    return True
+
+
 # ─── Robust appearance model ──────────────────────────────────────────────────
 
 class RobustAppearanceModel:
@@ -1712,7 +1770,8 @@ def run_reanalysis(
     with open(json_path, "w") as f:
         json.dump(result_data, f, indent=2)
 
-    # refine_v2 only: copy venue calibration/masks + run section analysis
+    # refine_v2 only: copy venue calibration/masks + regenerate masks for
+    # every refined analysis frame (stride may differ from first-pass) + sections
     if config.refine_v2:
         on_progress({
             "stage": "sections",
@@ -1725,6 +1784,22 @@ def run_reanalysis(
             )
         except Exception as exc:
             print(f"  [Reanalyzer v2] Warning: could not copy venue assets: {exc}")
+
+        on_progress({
+            "stage": "venue_masks",
+            "message": "Regenerando máscaras de pista para frames refinados…",
+            "percent": 97.0,
+        })
+        try:
+            if _reapply_venue_masks_for_refined(out_dir, Path(config.video_path)):
+                print(
+                    f"  [Reanalyzer v2] venue_masks re-applied → {out_dir.name}/"
+                )
+        except Exception as exc:
+            print(
+                f"  [Reanalyzer v2] Warning: venue mask re-apply failed "
+                f"(keeping copied masks): {exc}"
+            )
 
         try:
             from .section_analyzer import run_section_analysis

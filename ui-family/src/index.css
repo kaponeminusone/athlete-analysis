@@ -1,0 +1,160 @@
+@import "tailwindcss";
+
+@theme {
+  --color-bg: #0f0f0f;
+  --color-surface: #181818;
+  --color-elevated: #212121;
+  --color-border: #303030;
+  --color-muted: #aaaaaa;
+  --color-soft: #717171;
+  --color-text: #f1f1f1;
+  --color-accent: #ff0033;
+  --color-ok: #3dd68c;
+  --color-warn: #f5a524;
+  --font-display: "Roboto Condensed", sans-serif;
+  --font-ui: "Outfit", sans-serif;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  overflow: hidden;
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-ui);
+  -webkit-font-smoothing: antialiased;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Zonas gestuales: no selección de texto ni drag nativo de imágenes */
+.no-select,
+.no-select * {
+  -webkit-user-select: none !important;
+  user-select: none !important;
+  -webkit-touch-callout: none !important;
+  -webkit-user-drag: none;
+}
+
+.no-select img {
+  -webkit-user-drag: none;
+  user-drag: none;
+  pointer-events: none; /* el padre gestiona el pointer; evita drag fantasma */
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+  border: none;
+  background: none;
+  color: inherit;
+}
+
+img {
+  display: block;
+  max-width: 100%;
+}
+
+/* Scrollbars — streaming density */
+.rail-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: #505050 transparent;
+}
+
+.rail-scroll::-webkit-scrollbar {
+  height: 6px;
+  width: 6px;
+}
+
+.rail-scroll::-webkit-scrollbar-thumb {
+  background: #505050;
+  border-radius: 3px;
+}
+
+.rail-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes slide-up {
+  from {
+    transform: translateY(12px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+@keyframes skeleton-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 0.7;
+  }
+}
+
+.skeleton {
+  background: #2a2a2a;
+  animation: skeleton-pulse 1.4s ease-in-out infinite;
+}
+
+.toast-pop {
+  animation: slide-up 0.26s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* Polilínea "en vivo" del modo Definir pista */
+@keyframes pista-dash {
+  to {
+    stroke-dashoffset: -8;
+  }
+}
+
+.pista-live {
+  stroke-dasharray: 4 3;
+  animation: pista-dash 0.6s linear infinite;
+}
+
+@keyframes pista-pulse {
+  0%,
+  100% {
+    r: 1.2;
+    opacity: 1;
+  }
+  50% {
+    r: 2.2;
+    opacity: 0.6;
+  }
+}
+
+.pista-pulse {
+  animation: pista-pulse 0.9s ease-in-out infinite;
+}
