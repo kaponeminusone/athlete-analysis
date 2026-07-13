@@ -105,13 +105,26 @@ def _load_analysis_for_video(video_id: str, analysis_dir: Optional[str] = None) 
     return None
 
 
-def _load_frame_image(out_dir: Path, frame_idx: int) -> Optional[np.ndarray]:
+def _load_frame_image(
+    out_dir: Path,
+    frame_idx: int,
+    video_path: Optional[str] = None,
+) -> Optional[np.ndarray]:
     path = out_dir / "frames" / f"frame_{frame_idx:06d}.jpg"
     if path.exists():
         img = cv2.imread(str(path))
         if img is not None:
             return img
-    # nearest saved frame on disk
+    # Decodificar el frame exacto del video fuente (funciona sin JPEG en disco).
+    # video_path se resuelve, si no se pasa, del analysis.json del out_dir.
+    try:
+        from .frame_io import read_frame_bgr
+        img = read_frame_bgr(out_dir.name, frame_idx, out_dir.parent, video_path=video_path)
+        if img is not None:
+            return img
+    except Exception:
+        pass
+    # nearest saved frame on disk (secundario, sólo si no se pudo decodificar)
     frames_dir = out_dir / "frames"
     if not frames_dir.exists():
         return None
@@ -593,7 +606,7 @@ def render_pose_overlay(
         return img, {**meta, "error": "frame_missing", "frame_idx": frame_idx}
 
     actual_idx = int(cur_frame.get("frame_idx", frame_idx))
-    img_full = _load_frame_image(out_dir, actual_idx)
+    img_full = _load_frame_image(out_dir, actual_idx, video_path=analysis.get("video"))
     if img_full is None:
         img = _draw_error_placeholder("Sin imagen de frame")
         return img, {**meta, "error": "no_image", "frame_idx": actual_idx}

@@ -4,9 +4,13 @@ __pycache__/
 *.pyo
 output/
 *.pt
+node_modules/
 ui/node_modules/
 ui/dist/
+hoplab-cloud/web/node_modules/
+hoplab-cloud/web/dist/
 .env
 *.mp4
 *.mov
 *.avi
+*.MOV

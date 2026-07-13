@@ -28,6 +28,7 @@ from pathlib import Path
 from .pose_analyzer   import FrameAnalysis, analyze_frame_from_tracker
 from .athlete_tracker import TrackState, run_tracked_frame, _padded_crop
 from .sot             import SotBackend
+from . import opt_flags
 
 
 CorrectionType = Literal["bbox_correction", "click_selection", "mask_correction"]
@@ -294,7 +295,7 @@ def propagate_correction(
         )
         fa = analyze_frame_from_tracker(frame_idx=frame_idx, timestamp_s=ts,
                                         tracker_result=tracker_out)
-        if frames_dir:
+        if frames_dir and opt_flags.correction_write_frames():
             fpath = str(Path(frames_dir) / f"frame_{frame_idx:06d}.jpg")
             cv2.imwrite(fpath, frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
         updated.append(fa)
@@ -325,7 +326,7 @@ def propagate_correction(
             fa = analyze_frame_from_tracker(frame_idx=frame_idx, timestamp_s=ts,
                                             tracker_result=tracker_out)
 
-        if frames_dir:
+        if frames_dir and opt_flags.correction_write_frames():
             fpath = str(Path(frames_dir) / f"frame_{frame_idx:06d}.jpg")
             cv2.imwrite(fpath, frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
         updated.append(fa)

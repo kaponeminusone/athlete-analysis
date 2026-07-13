@@ -1,0 +1,11 @@
+# HopLab — dependencias para Google Colab (Python 3.10/3.11, CUDA 12.1)
+# Instalar PyTorch primero via celda del notebook (ya viene preinstalado en Colab).
+# Este archivo cubre el resto.
+
+ultralytics>=8.3.0
+opencv-python-headless>=4.9.0
+numpy>=1.26.0
+scipy>=1.13.0
+matplotlib>=3.9.0
+fastapi>=0.115.0
+uvicorn>=0.30.0

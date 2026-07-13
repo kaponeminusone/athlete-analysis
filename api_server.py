@@ -68,7 +68,9 @@ from src.pose_analyzer    import FrameAnalysis, analyze_frame_from_tracker
 from src.athlete_tracker  import TrackState, run_tracked_frame
 from src.correction       import Correction, apply_correction, propagate_correction, detections_for_frame
 from src.sot              import create_sot
-from src.visualizer       import annotate_frame
+from src.visualizer       import annotate_frame, annotate_frame_array
+from src.frame_io         import read_frame_bgr
+from src                  import opt_flags
 from src.pipeline         import PipelineConfig, run_pipeline
 from src.job_store        import create_job, get_job, list_jobs
 from src.reanalyzer       import ReanalysisConfig, run_reanalysis
@@ -109,8 +111,9 @@ from src.venue_profile    import (
 from src.venue_masks import should_use_keyframe_pipeline
 from src.venue_seg_infer import has_trained_seg_model, load_model_meta
 
-OUTPUT_ROOT = Path("output")
-VENUE_ROOT = Path("venues")
+OUTPUT_ROOT = Path(os.getenv("HOPLAB_OUTPUT_ROOT", "output"))
+VENUE_ROOT  = Path(os.getenv("HOPLAB_VENUE_ROOT",  "venues"))
+VIDEO_ROOT  = Path(os.getenv("HOPLAB_VIDEO_ROOT",  "."))
 app = FastAPI(title="Triple Jump Analyzer API")
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 
@@ -125,6 +128,35 @@ app.add_middleware(
 _models: dict = {}
 _track_states: dict = {}      # video_name → TrackState
 _analyses_cache: dict = {}    # video_name → list[FrameAnalysis]
+
+# ─── LRU opcional para bytes anotados servidos por get_frame ───────────────────
+# Guardado por opt_flags.annotated_cache() (env TJ_ANNOTATED_CACHE, default OFF).
+from collections import OrderedDict as _OrderedDict
+
+_ANNOTATED_CACHE_MAX = 32
+_annotated_bytes_cache: "_OrderedDict[tuple, bytes]" = _OrderedDict()
+
+
+def _analysis_mtime(video_name: str) -> float:
+    path = OUTPUT_ROOT / video_name / "analysis.json"
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _annotated_cache_get(key: tuple) -> Optional[bytes]:
+    data = _annotated_bytes_cache.get(key)
+    if data is not None:
+        _annotated_bytes_cache.move_to_end(key)
+    return data
+
+
+def _annotated_cache_put(key: tuple, data: bytes) -> None:
+    _annotated_bytes_cache[key] = data
+    _annotated_bytes_cache.move_to_end(key)
+    while len(_annotated_bytes_cache) > _ANNOTATED_CACHE_MAX:
+        _annotated_bytes_cache.popitem(last=False)
 
 
 def _get_models():
@@ -1266,7 +1298,7 @@ def get_demo():
 def list_videos():
     videos = []
     ignored_parts = {"venv", "node_modules", ".git", "__pycache__", "dist"}
-    for path in Path(".").rglob("*"):
+    for path in VIDEO_ROOT.rglob("*"):
         if not path.is_file() or path.suffix.lower() not in VIDEO_EXTENSIONS:
             continue
         if any(part in ignored_parts for part in path.parts):
@@ -1586,9 +1618,10 @@ def correct_frame(req: CorrectionRequest):
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
 
-    # Save annotated frame
-    annotated_path = str(out_dir / "annotated" / f"annotated_{req.frame_idx:06d}.jpg")
-    annotate_frame(frame_path, corrected_fa, annotated_path)
+    # Save annotated frame (sólo si la bandera de anotados está ON)
+    if opt_flags.write_annotated():
+        annotated_path = str(out_dir / "annotated" / f"annotated_{req.frame_idx:06d}.jpg")
+        annotate_frame(frame_path, corrected_fa, annotated_path)
 
     # Build optional SOT backend for forward propagation
     sot = None
@@ -1628,12 +1661,18 @@ def correct_frame(req: CorrectionRequest):
         end_frame=req.propagation_end_frame,
     )
 
-    # Re-annotate updated frames
-    for fa in updated_fas:
-        fp = str(out_dir / "frames" / f"frame_{fa.frame_idx:06d}.jpg")
-        ap = str(out_dir / "annotated" / f"annotated_{fa.frame_idx:06d}.jpg")
-        if Path(fp).exists():
-            annotate_frame(fp, fa, ap)
+    # Re-annotate updated frames (usa read_frame_bgr → funciona en modo lean,
+    # decodificando del video si el JPEG del frame no está en disco).
+    if opt_flags.write_annotated():
+        for fa in updated_fas:
+            ap = str(out_dir / "annotated" / f"annotated_{fa.frame_idx:06d}.jpg")
+            img = read_frame_bgr(
+                out_dir.name, fa.frame_idx, out_dir.parent, video_path=req.video_path,
+            )
+            if img is not None:
+                annotated_img = annotate_frame_array(img.copy(), fa)
+                Path(ap).parent.mkdir(parents=True, exist_ok=True)
+                cv2.imwrite(ap, annotated_img)
 
     # Serialize to JSON-safe dicts
     def _fa_to_dict(fa: FrameAnalysis) -> dict:
@@ -1690,45 +1729,86 @@ def _build_fa_from_json(frame_data: dict) -> "FrameAnalysis":
     return frame_record_to_analysis(frame_data)
 
 
+def _jpeg_response(img: "np.ndarray"):
+    """Codificar una imagen BGR a JPEG en memoria y devolverla como Response."""
+    from fastapi.responses import Response as RawResponse
+    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, opt_flags.jpeg_quality()])
+    if not ok:
+        raise HTTPException(500, "Failed to encode frame")
+    return RawResponse(content=buf.tobytes(), media_type="image/jpeg")
+
+
 @app.get("/frame/{video_name}/{frame_idx}")
 def get_frame(video_name: str, frame_idx: int, annotated: bool = True):
     """
     Serve a frame image. If annotated=True and the pre-generated annotated
-    image doesn't exist, generate it on-demand from analysis.json data.
+    image doesn't exist, regenerate it (in memory, or on disk when
+    TJ_WRITE_ANNOTATED is on) from analysis.json data. The raw frame is
+    resolved via read_frame_bgr, so it works even without frames/*.jpg on disk
+    (decoding from the source video as a fallback).
     """
+    from fastapi.responses import Response as RawResponse
+
     if annotated:
         ann_path = OUTPUT_ROOT / video_name / "annotated" / f"annotated_{frame_idx:06d}.jpg"
+        # 1) Pre-generado en disco → servir tal cual (compatibilidad, sin cambios)
         if ann_path.exists():
             return FileResponse(str(ann_path), media_type="image/jpeg")
 
-        # On-demand annotation: rebuild from analysis.json
+        # 2) LRU opcional de bytes anotados (default OFF)
+        use_cache = opt_flags.annotated_cache()
+        cache_key = (video_name, frame_idx, _analysis_mtime(video_name))
+        if use_cache:
+            cached = _annotated_cache_get(cache_key)
+            if cached is not None:
+                return RawResponse(content=cached, media_type="image/jpeg")
+
+        # 3) Regenerar: frame crudo (disco o video) + datos de analysis.json
+        img = read_frame_bgr(video_name, frame_idx, OUTPUT_ROOT)
+        analysis = _load_analysis(video_name)
+        if img is not None and analysis and "frames" in analysis:
+            frame_data = next(
+                (f for f in analysis["frames"] if f.get("frame_idx") == frame_idx),
+                None,
+            )
+            if frame_data:
+                try:
+                    fa = _build_fa_from_json(frame_data)
+                    annotated_img = annotate_frame_array(img.copy(), fa)
+                    if opt_flags.write_annotated():
+                        # Paridad con hoy: cachear en disco cuando la bandera está ON
+                        ann_path.parent.mkdir(parents=True, exist_ok=True)
+                        cv2.imwrite(str(ann_path), annotated_img)
+                        return FileResponse(str(ann_path), media_type="image/jpeg")
+                    # Modo lean: servir bytes sin escribir a disco
+                    ok, buf = cv2.imencode(
+                        ".jpg", annotated_img,
+                        [cv2.IMWRITE_JPEG_QUALITY, opt_flags.jpeg_quality()],
+                    )
+                    if ok:
+                        data = buf.tobytes()
+                        if use_cache:
+                            _annotated_cache_put(cache_key, data)
+                        return RawResponse(content=data, media_type="image/jpeg")
+                except Exception:
+                    pass  # cae al frame crudo
+
+        # 4) Fallback final: frame crudo (disco tal cual, o decodificado del video)
         raw_path = OUTPUT_ROOT / video_name / "frames" / f"frame_{frame_idx:06d}.jpg"
         if raw_path.exists():
-            analysis = _load_analysis(video_name)
-            if analysis and "frames" in analysis:
-                frame_data = next(
-                    (f for f in analysis["frames"] if f.get("frame_idx") == frame_idx),
-                    None,
-                )
-                if frame_data:
-                    try:
-                        fa = _build_fa_from_json(frame_data)
-                        ann_path.parent.mkdir(parents=True, exist_ok=True)
-                        annotate_frame(str(raw_path), fa, str(ann_path))
-                        return FileResponse(str(ann_path), media_type="image/jpeg")
-                    except Exception:
-                        pass  # fall through to raw frame
-
-        # Final fallback: raw frame
-        if raw_path.exists():
             return FileResponse(str(raw_path), media_type="image/jpeg")
+        if img is not None:
+            return _jpeg_response(img)
         raise HTTPException(404, f"Frame {frame_idx} not found for {video_name}")
 
     # raw
     raw_path = OUTPUT_ROOT / video_name / "frames" / f"frame_{frame_idx:06d}.jpg"
-    if not raw_path.exists():
+    if raw_path.exists():
+        return FileResponse(str(raw_path), media_type="image/jpeg")
+    img = read_frame_bgr(video_name, frame_idx, OUTPUT_ROOT)
+    if img is None:
         raise HTTPException(404, f"Frame {frame_idx} not found for {video_name}")
-    return FileResponse(str(raw_path), media_type="image/jpeg")
+    return _jpeg_response(img)
 
 
 @app.get("/frame/{video_name}/{frame_idx}/annotated")
@@ -1743,12 +1823,11 @@ def get_frame_detections(video_name: str, frame_idx: int, video_path: str):
     The UI uses this to show bounding boxes and let the user click one.
     """
     _, model_seg = _get_models()
-    frame_path = OUTPUT_ROOT / video_name / "frames" / f"frame_{frame_idx:06d}.jpg"
-    if not frame_path.exists():
+    frame = read_frame_bgr(video_name, frame_idx, OUTPUT_ROOT, video_path=video_path)
+    if frame is None:
         raise HTTPException(404, f"Frame {frame_idx} not found")
 
-    frame = cv2.imread(str(frame_path))
-    dets  = detections_for_frame(frame, model_seg)
+    dets = detections_for_frame(frame, model_seg)
 
     return {
         "frame_idx":  frame_idx,

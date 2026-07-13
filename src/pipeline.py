@@ -18,7 +18,8 @@ import numpy as np
 from .frame_extractor import get_video_info
 from .pose_analyzer   import FrameAnalysis, CameraAngle, analyze_frame, analyze_frame_from_tracker
 from .athlete_tracker import TrackState, run_tracked_frame
-from .visualizer      import annotate_frame, generate_timeline_chart
+from .visualizer      import annotate_frame, annotate_frame_array, generate_timeline_chart
+from . import opt_flags
 from .job_store       import ProgressCallback, noop_progress
 from .schemas         import (
     build_analysis_document,
@@ -54,7 +55,15 @@ def run_pipeline(
     out_frames    = Path(config.output_dir) / "frames"
     out_annotated = Path(config.output_dir) / "annotated"
     out_charts    = Path(config.output_dir) / "charts"
-    for d in [out_frames, out_annotated, out_charts]:
+    # Gate de escritura opt-in (defaults TRUE → mismo comportamiento que hoy)
+    _persist_frames  = opt_flags.persist_frames()
+    _write_annotated = opt_flags.write_annotated()
+    _dirs = [out_charts]
+    if _persist_frames:
+        _dirs.append(out_frames)
+    if _write_annotated:
+        _dirs.append(out_annotated)
+    for d in _dirs:
         d.mkdir(parents=True, exist_ok=True)
 
     # ── Stage: loading_models ─────────────────────────────────────────────────
@@ -154,7 +163,8 @@ def run_pipeline(
                 tracker_outputs.append(tracker_out)
 
                 fpath = out_frames / f"frame_{frame_abs:06d}.jpg"
-                cv2.imwrite(str(fpath), frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
+                if _persist_frames:
+                    cv2.imwrite(str(fpath), frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
 
                 analysis_count += 1
 
@@ -177,14 +187,24 @@ def run_pipeline(
                         ),
                     })
 
-                should_annotate = (analysis_count % config.annotate_every == 0)
+                should_annotate = _write_annotated and (analysis_count % config.annotate_every == 0)
                 if should_annotate:
                     out_img = out_annotated / f"annotated_{frame_abs:06d}.jpg"
-                    annotate_frame(
-                        str(fpath), fa, str(out_img),
-                        seg_mask=tracker_out.get("seg_mask"),
-                        appearance_sim=tracker_out.get("appearance_sim", 0.0),
-                    )
+                    if _persist_frames:
+                        annotate_frame(
+                            str(fpath), fa, str(out_img),
+                            seg_mask=tracker_out.get("seg_mask"),
+                            appearance_sim=tracker_out.get("appearance_sim", 0.0),
+                        )
+                    else:
+                        # Sin frames en disco: anotar desde memoria
+                        ann_img = annotate_frame_array(
+                            frame.copy(), fa,
+                            seg_mask=tracker_out.get("seg_mask"),
+                            appearance_sim=tracker_out.get("appearance_sim", 0.0),
+                        )
+                        out_img.parent.mkdir(parents=True, exist_ok=True)
+                        cv2.imwrite(str(out_img), ann_img)
                     annotated_count += 1
 
                 if config.max_frames and analysis_count >= config.max_frames:
@@ -201,7 +221,8 @@ def run_pipeline(
                 tracker_outputs.append({})
 
                 fpath = out_frames / f"frame_{frame_abs:06d}.jpg"
-                cv2.imwrite(str(fpath), frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
+                if _persist_frames:
+                    cv2.imwrite(str(fpath), frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
                 analysis_count += 1
 
                 if analysis_count % 5 == 0:
@@ -215,9 +236,14 @@ def run_pipeline(
                         "message":         f"Pose en frame {frame_abs}/{end_f}",
                     })
 
-                if should_annotate := (analysis_count % config.annotate_every == 0):
+                if should_annotate := (_write_annotated and analysis_count % config.annotate_every == 0):
                     out_img = out_annotated / f"annotated_{frame_abs:06d}.jpg"
-                    annotate_frame(str(fpath), fa, str(out_img))
+                    if _persist_frames:
+                        annotate_frame(str(fpath), fa, str(out_img))
+                    else:
+                        ann_img = annotate_frame_array(frame.copy(), fa)
+                        out_img.parent.mkdir(parents=True, exist_ok=True)
+                        cv2.imwrite(str(out_img), ann_img)
                     annotated_count += 1
 
                 if config.max_frames and analysis_count >= config.max_frames:

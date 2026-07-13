@@ -86,23 +86,22 @@ def _draw_seg_mask(img: np.ndarray, mask: np.ndarray,
     return overlay
 
 
-def annotate_frame(
-    image_path: str,
+def annotate_frame_array(
+    img: np.ndarray,
     analysis: FrameAnalysis,
-    output_path: str,
     seg_mask: Optional[np.ndarray] = None,   # bool [H,W] from tracker
     appearance_sim: float = 0.0,
     draw_skeleton: bool = True,
     draw_bbox: bool = True,
 ) -> np.ndarray:
     """
-    Load a frame, draw all annotations, save to output_path.
-    Returns the annotated image (numpy BGR).
-    """
-    img = cv2.imread(image_path)
-    if img is None:
-        raise FileNotFoundError(f"Cannot read image: {image_path}")
+    Dibuja todas las anotaciones sobre una imagen BGR EN MEMORIA (sin IO a disco).
+    Devuelve la imagen anotada (numpy BGR). Esta es la única lógica de dibujo;
+    annotate_frame() sólo añade lectura/escritura de archivos por encima.
 
+    Nota: dibuja parcialmente in-place. Pasa una copia si necesitas conservar el
+    original intacto.
+    """
     angle_color = COLORS.get(analysis.camera_angle, (128, 128, 128))
     mask_color  = MASK_COLORS.get(analysis.camera_angle, (160, 160, 160))
 
@@ -237,6 +236,34 @@ def annotate_frame(
         cv2.rectangle(img, (lx, ly + i*18), (lx+12, ly + i*18 + 12), col, -1)
         cv2.putText(img, angle.value, (lx+16, ly + i*18 + 11),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200,200,200), 1)
+
+    return img
+
+
+def annotate_frame(
+    image_path: str,
+    analysis: FrameAnalysis,
+    output_path: str,
+    seg_mask: Optional[np.ndarray] = None,   # bool [H,W] from tracker
+    appearance_sim: float = 0.0,
+    draw_skeleton: bool = True,
+    draw_bbox: bool = True,
+) -> np.ndarray:
+    """
+    Load a frame, draw all annotations, save to output_path.
+    Returns the annotated image (numpy BGR).
+    """
+    img = cv2.imread(image_path)
+    if img is None:
+        raise FileNotFoundError(f"Cannot read image: {image_path}")
+
+    img = annotate_frame_array(
+        img, analysis,
+        seg_mask=seg_mask,
+        appearance_sim=appearance_sim,
+        draw_skeleton=draw_skeleton,
+        draw_bbox=draw_bbox,
+    )
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     cv2.imwrite(output_path, img)

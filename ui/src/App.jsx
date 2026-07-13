@@ -384,16 +384,29 @@ function hasLearnableVenueData(calibration, venueBrushByFrame, venueBrushPoints)
   return brush || polys.track > 0;
 }
 
-function getFrameAsset(project, frame, version = 0) {
+function getFrameAsset(project, frame, version = 0, annotated = true) {
   if (!project || !frame) return "";
-  const padded = String(frame.frame_idx ?? 0).padStart(6, "0");
-  const url = (
-    project.assets.annotated[padded] ||
-    project.assets.frames[padded] ||
-    project.assets.annotated[String(frame.frame_idx)] ||
-    project.assets.frames[String(frame.frame_idx)] ||
-    ""
-  );
+  const frameIdx = frame.frame_idx ?? 0;
+  const padded = String(frameIdx).padStart(6, "0");
+
+  // The /frame endpoint reads OUTPUT_ROOT/<name>/{annotated,frames}, so the
+  // name must be the output folder stem (includes _refined for refined runs),
+  // not video_name (the raw video stem).
+  const outputName =
+    (project.output?.path || "").split(/[\\/]/).filter(Boolean).pop() ||
+    project.video?.video_name ||
+    "";
+
+  // Prefer the canonical /frame endpoint: it rebuilds annotated frames
+  // on-demand, so images resolve even when annotated/ is empty on disk.
+  // Fall back to the /media-indexed asset maps when no name is resolvable.
+  const url = outputName
+    ? `/frame/${encodeURIComponent(outputName)}/${frameIdx}?annotated=${annotated ? "true" : "false"}`
+    : project.assets.annotated[padded] ||
+      project.assets.frames[padded] ||
+      project.assets.annotated[String(frameIdx)] ||
+      project.assets.frames[String(frameIdx)] ||
+      "";
   return url && version ? `${url}${url.includes("?") ? "&" : "?"}v=${version}` : url;
 }
 

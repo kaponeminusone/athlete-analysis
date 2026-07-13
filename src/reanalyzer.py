@@ -47,7 +47,8 @@ from .pose_analyzer import (
     FrameAnalysis,
     analyze_frame_from_tracker,
 )
-from .visualizer import annotate_frame
+from .visualizer import annotate_frame, annotate_frame_array
+from . import opt_flags
 from .schemas import (
     build_analysis_document,
     frame_analysis_to_dict,
@@ -681,7 +682,7 @@ def _v2_gap_fill_pass(
         else:
             filled_late += 1
 
-        if annotate_every > 0 and (i % annotate_every == 0):
+        if opt_flags.write_annotated() and annotate_every > 0 and (i % annotate_every == 0):
             out_img = annotated_dir / f"annotated_{fa_new.frame_idx:06d}.jpg"
             annotate_frame(
                 str(fpath), fa_new, str(out_img),
@@ -1501,7 +1502,15 @@ def run_reanalysis(
     out_frames    = out_dir / "frames"
     out_annotated = out_dir / "annotated"
     out_charts    = out_dir / "charts"
-    for d in [out_frames, out_annotated, out_charts]:
+    # Gate de escritura opt-in (defaults TRUE → mismo comportamiento que hoy)
+    _persist_frames  = opt_flags.persist_frames()
+    _write_annotated = opt_flags.write_annotated()
+    _dirs = [out_charts]
+    if _persist_frames:
+        _dirs.append(out_frames)
+    if _write_annotated:
+        _dirs.append(out_annotated)
+    for d in _dirs:
         d.mkdir(parents=True, exist_ok=True)
 
     # ── Load models ───────────────────────────────────────────────────────────
@@ -1666,7 +1675,8 @@ def run_reanalysis(
             analysis_count += 1
 
             fpath = out_frames / f"frame_{frame_abs:06d}.jpg"
-            cv2.imwrite(str(fpath), frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
+            if _persist_frames:
+                cv2.imwrite(str(fpath), frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
 
             if analysis_count % 5 == 0 or frame_abs >= end_f - config.stride:
                 streamed = frame_abs - start_f
@@ -1684,10 +1694,16 @@ def run_reanalysis(
                     ),
                 })
 
-            if analysis_count % config.annotate_every == 0:
+            if _write_annotated and analysis_count % config.annotate_every == 0:
                 out_img = out_annotated / f"annotated_{frame_abs:06d}.jpg"
-                annotate_frame(str(fpath), fa, str(out_img),
-                               seg_mask=None, appearance_sim=0.0)
+                if _persist_frames:
+                    annotate_frame(str(fpath), fa, str(out_img),
+                                   seg_mask=None, appearance_sim=0.0)
+                else:
+                    ann_img = annotate_frame_array(frame.copy(), fa,
+                                                   seg_mask=None, appearance_sim=0.0)
+                    out_img.parent.mkdir(parents=True, exist_ok=True)
+                    cv2.imwrite(str(out_img), ann_img)
                 annotated_count += 1
 
         frame_abs += 1
