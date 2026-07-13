@@ -237,12 +237,15 @@ export default function Timeline({
         >
           <div className="absolute inset-0 flex">
             {frames
-              .filter((_, i) => i % 2 === 0)
+              // Cada 5.º frame + lazy: evita stampede de N×7s al abrir (túnel Colab)
+              .filter((_, i) => i % 5 === 0)
               .map((f) => (
                 <img
                   key={f.index}
                   src={f.raw}
                   alt=""
+                  loading="lazy"
+                  decoding="async"
                   className="h-full w-[64px] shrink-0 object-cover opacity-70"
                   draggable={false}
                 />

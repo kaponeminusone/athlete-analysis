@@ -12,13 +12,23 @@ y overlays pueden reconstruir cualquier frame decodificando del video original.
 El video_path se resuelve, si no se pasa, del campo "video" de analysis.json
 (igual que hace POST /correct al recibir req.video_path).
 
-Cache LRU en memoria OPCIONAL (OrderedDict, máx ~32 frames), desactivada por
-defecto (env TJ_FRAME_CACHE). Sólo cachea frames decodificados del video.
+Cache LRU en memoria OPCIONAL (OrderedDict), desactivada por defecto
+(env TJ_FRAME_CACHE). Tamaño vía TJ_FRAME_CACHE_MAX (default 128).
+Sólo cachea frames decodificados del video (no los leídos de JPEG en disco).
+
+VideoCapture reutilizado por ruta (proceso local, con lock):
+  Evita open/seek/close en cada GET /frame — crítico en Google Drive FUSE.
+  Limitaciones:
+    - Un handle por path; seeks concurrentes se serializan con un lock.
+    - No se comparte entre workers de uvicorn (cada proceso tiene su cache).
+    - Seek por índice es aproximado en algunos codecs/contenedores.
+    - Si el archivo se reemplaza en disco, puede hacer falta reiniciar el API.
 """
 
 from __future__ import annotations
 
 import json
+import threading
 from collections import OrderedDict
 from pathlib import Path
 from typing import Optional
@@ -28,22 +38,80 @@ import numpy as np
 
 from . import opt_flags
 
-_CACHE_MAX = 32
 _frame_cache: "OrderedDict[tuple[str, int], np.ndarray]" = OrderedDict()
+_frame_cache_lock = threading.Lock()
+
+# path → (VideoCapture, per-path lock)
+_caps: dict[str, tuple["cv2.VideoCapture", threading.Lock]] = {}
+_caps_lock = threading.Lock()
 
 
 def _cache_get(key: tuple[str, int]) -> Optional[np.ndarray]:
-    img = _frame_cache.get(key)
-    if img is not None:
-        _frame_cache.move_to_end(key)
-    return img
+    with _frame_cache_lock:
+        img = _frame_cache.get(key)
+        if img is not None:
+            _frame_cache.move_to_end(key)
+        return img
 
 
 def _cache_put(key: tuple[str, int], img: np.ndarray) -> None:
-    _frame_cache[key] = img
-    _frame_cache.move_to_end(key)
-    while len(_frame_cache) > _CACHE_MAX:
-        _frame_cache.popitem(last=False)
+    max_size = opt_flags.frame_cache_max()
+    with _frame_cache_lock:
+        _frame_cache[key] = img
+        _frame_cache.move_to_end(key)
+        while len(_frame_cache) > max_size:
+            _frame_cache.popitem(last=False)
+
+
+def _cap_key(video_path: str) -> str:
+    try:
+        return str(Path(video_path).resolve())
+    except OSError:
+        return str(video_path)
+
+
+def _open_capture(video_path: str) -> tuple["cv2.VideoCapture", threading.Lock]:
+    """Open (or reopen) a VideoCapture and register it. Caller holds _caps_lock."""
+    key = _cap_key(video_path)
+    old = _caps.pop(key, None)
+    if old is not None:
+        try:
+            old[0].release()
+        except Exception:
+            pass
+    cap = cv2.VideoCapture(str(video_path))
+    lock = threading.Lock()
+    _caps[key] = (cap, lock)
+    return cap, lock
+
+
+def _get_capture(video_path: str) -> tuple["cv2.VideoCapture", threading.Lock]:
+    """Reuse an open VideoCapture for this path (process-local)."""
+    key = _cap_key(video_path)
+    with _caps_lock:
+        entry = _caps.get(key)
+        if entry is not None:
+            cap, lock = entry
+            if cap.isOpened():
+                return cap, lock
+        return _open_capture(video_path)
+
+
+def _read_video_frame(video_path: str, frame_idx: int) -> Optional[np.ndarray]:
+    """Seek + read with a reused handle. Serialized per path."""
+    for attempt in range(2):
+        cap, lock = _get_capture(video_path)
+        with lock:
+            if cap.isOpened():
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                ret, img = cap.read()
+                if ret and img is not None:
+                    return img
+        # Fuera del lock de path: reabrir una vez (FUSE / handle stale)
+        if attempt == 0:
+            with _caps_lock:
+                _open_capture(video_path)
+    return None
 
 
 _VIDEO_EXTS = (".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v")
@@ -112,17 +180,12 @@ def read_frame_bgr(
         if cached is not None:
             return cached
 
-    # (2) decodificar del video fuente
+    # (2) decodificar del video fuente (handle reutilizado)
     if video_path is None:
         video_path = _resolve_video_path(video_name, output_root)
     if video_path and Path(video_path).exists():
-        cap = cv2.VideoCapture(str(video_path))
-        try:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            ret, img = cap.read()
-        finally:
-            cap.release()
-        if ret and img is not None:
+        img = _read_video_frame(video_path, frame_idx)
+        if img is not None:
             if use_cache:
                 _cache_put(cache_key, img)
             return img

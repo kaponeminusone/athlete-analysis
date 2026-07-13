@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { AlertTriangle, X } from "lucide-react";
-import { learnVenue, pollJob, trainVenue } from "../api/client";
+import { learnVenue, pollJob, trainVenue, getVenueModel } from "../api/client";
 import {
   deltaChip,
   formatTime,
@@ -99,6 +99,7 @@ export default function SidePanel({
   const [busyScale, setBusyScale] = useState(false);
   const [busyLearn, setBusyLearn] = useState(false);
   const [trainMsg, setTrainMsg] = useState(null);
+  const [venueModel, setVenueModel] = useState(null);
   const timer = useRef(null);
   const autoRan = useRef(false);
   const analyzeInFlight = useRef(false);
@@ -189,6 +190,33 @@ export default function SidePanel({
   useEffect(() => {
     autoRan.current = false;
   }, [videoName, videoPath]);
+
+  // Estado CNN de pista (GET /api/venue/model)
+  useEffect(() => {
+    if (!apiEnabled) {
+      setVenueModel(null);
+      return undefined;
+    }
+    let cancelled = false;
+    getVenueModel()
+      .then((m) => {
+        if (!cancelled) setVenueModel(m);
+      })
+      .catch(() => {
+        if (!cancelled) setVenueModel({ trained: false });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [apiEnabled, videoName, trainMsg, busyLearn]);
+
+  const cnnTrained = Boolean(venueModel?.trained);
+
+  useEffect(() => {
+    if (apiEnabled && venueModel != null && !cnnTrained) {
+      setConfig((c) => (c.useVenueMap ? { ...c, useVenueMap: false } : c));
+    }
+  }, [apiEnabled, venueModel, cnnTrained, setConfig]);
 
   /** Aprende colores de pista/arena de este video (venue/learn, síncrono). */
   async function learnVenueNow() {
@@ -285,6 +313,21 @@ export default function SidePanel({
                   <span className="text-text">mapa de pista</span>,{" "}
                   <span className="text-text">refine</span> y{" "}
                   <span className="text-text">fases automáticas</span>.
+                </div>
+              )}
+
+              {apiEnabled && (
+                <div
+                  className={`flex items-center justify-between rounded-lg px-3 py-2 text-xs ring-1 ${
+                    cnnTrained
+                      ? "bg-ok/10 text-ok ring-ok/30"
+                      : "bg-warn/10 text-warn ring-warn/30"
+                  }`}
+                >
+                  <span className="font-medium">CNN pista</span>
+                  <span className="font-semibold tabular-nums">
+                    {venueModel == null ? "…" : cnnTrained ? "sí" : "no"}
+                  </span>
                 </div>
               )}
 
@@ -408,13 +451,19 @@ export default function SidePanel({
                 hint="Refinado + fases automáticas (recomendado)"
               />
               <Toggle
-                checked={Boolean(config.useVenueMap)}
+                checked={Boolean(config.useVenueMap) && cnnTrained}
                 onChange={(v) => setConfig((c) => ({ ...c, useVenueMap: v }))}
                 label="Usar mapa de pista y arena"
+                disabled={apiEnabled && venueModel != null && !cnnTrained}
+                disabledHint="Sin pesos CNN en el motor. Sincroniza venue-default-weights.zip a Drive (venues/default) y reinicia / verifica GET /api/venue/model."
                 hint={
-                  hasMasks
+                  !apiEnabled
                     ? "Mapear con CNN / perfil del estadio al analizar"
-                    : "Si hay CNN o perfil, se aplica al analizar"
+                    : cnnTrained
+                      ? hasMasks
+                        ? "Mapear con CNN / perfil del estadio al analizar"
+                        : "Si hay CNN o perfil, se aplica al analizar"
+                      : "Requiere modelo entrenado en Drive (venues/default)"
                 }
               />
 

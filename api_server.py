@@ -133,9 +133,10 @@ _analyses_cache: dict = {}    # video_name → list[FrameAnalysis]
 
 # ─── LRU opcional para bytes anotados servidos por get_frame ───────────────────
 # Guardado por opt_flags.annotated_cache() (env TJ_ANNOTATED_CACHE, default OFF).
+# Tamaño: TJ_ANNOTATED_CACHE_MAX (default 64).
 from collections import OrderedDict as _OrderedDict
 
-_ANNOTATED_CACHE_MAX = 32
+_FRAME_CACHE_CONTROL = "public, max-age=120"
 _annotated_bytes_cache: "_OrderedDict[tuple, bytes]" = _OrderedDict()
 
 
@@ -155,10 +156,30 @@ def _annotated_cache_get(key: tuple) -> Optional[bytes]:
 
 
 def _annotated_cache_put(key: tuple, data: bytes) -> None:
+    max_size = opt_flags.annotated_cache_max()
     _annotated_bytes_cache[key] = data
     _annotated_bytes_cache.move_to_end(key)
-    while len(_annotated_bytes_cache) > _ANNOTATED_CACHE_MAX:
+    while len(_annotated_bytes_cache) > max_size:
         _annotated_bytes_cache.popitem(last=False)
+
+
+def _frame_file_response(path: str):
+    """FileResponse JPEG con Cache-Control (cliente bustea con v=reloadToken)."""
+    return FileResponse(
+        path,
+        media_type="image/jpeg",
+        headers={"Cache-Control": _FRAME_CACHE_CONTROL},
+    )
+
+
+def _frame_bytes_response(data: bytes):
+    from fastapi.responses import Response as RawResponse
+
+    return RawResponse(
+        content=data,
+        media_type="image/jpeg",
+        headers={"Cache-Control": _FRAME_CACHE_CONTROL},
+    )
 
 
 def _get_models():
@@ -1845,11 +1866,10 @@ def _build_fa_from_json(frame_data: dict) -> "FrameAnalysis":
 
 def _jpeg_response(img: "np.ndarray"):
     """Codificar una imagen BGR a JPEG en memoria y devolverla como Response."""
-    from fastapi.responses import Response as RawResponse
     ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, opt_flags.jpeg_quality()])
     if not ok:
         raise HTTPException(500, "Failed to encode frame")
-    return RawResponse(content=buf.tobytes(), media_type="image/jpeg")
+    return _frame_bytes_response(buf.tobytes())
 
 
 @app.get("/frame/{video_name}/{frame_idx}")
@@ -1867,8 +1887,6 @@ def get_frame(
     (decoding from the source video as a fallback — including videos that
     still have no analysis.json, via video_path query or HOPLAB_VIDEO_ROOT).
     """
-    from fastapi.responses import Response as RawResponse
-
     # Si el caller pasa video_path (biblioteca sin analysis), validar existencia.
     resolved_vp: Optional[str] = None
     if video_path:
@@ -1880,7 +1898,7 @@ def get_frame(
         ann_path = OUTPUT_ROOT / video_name / "annotated" / f"annotated_{frame_idx:06d}.jpg"
         # 1) Pre-generado en disco → servir tal cual (compatibilidad, sin cambios)
         if ann_path.exists():
-            return FileResponse(str(ann_path), media_type="image/jpeg")
+            return _frame_file_response(str(ann_path))
 
         # 2) LRU opcional de bytes anotados (default OFF)
         use_cache = opt_flags.annotated_cache()
@@ -1888,7 +1906,7 @@ def get_frame(
         if use_cache:
             cached = _annotated_cache_get(cache_key)
             if cached is not None:
-                return RawResponse(content=cached, media_type="image/jpeg")
+                return _frame_bytes_response(cached)
 
         # 3) Regenerar: frame crudo (disco o video) + datos de analysis.json
         img = read_frame_bgr(
@@ -1908,7 +1926,7 @@ def get_frame(
                         # Paridad con hoy: cachear en disco cuando la bandera está ON
                         ann_path.parent.mkdir(parents=True, exist_ok=True)
                         cv2.imwrite(str(ann_path), annotated_img)
-                        return FileResponse(str(ann_path), media_type="image/jpeg")
+                        return _frame_file_response(str(ann_path))
                     # Modo lean: servir bytes sin escribir a disco
                     ok, buf = cv2.imencode(
                         ".jpg", annotated_img,
@@ -1918,14 +1936,14 @@ def get_frame(
                         data = buf.tobytes()
                         if use_cache:
                             _annotated_cache_put(cache_key, data)
-                        return RawResponse(content=data, media_type="image/jpeg")
+                        return _frame_bytes_response(data)
                 except Exception:
                     pass  # cae al frame crudo
 
         # 4) Fallback final: frame crudo (disco tal cual, o decodificado del video)
         raw_path = OUTPUT_ROOT / video_name / "frames" / f"frame_{frame_idx:06d}.jpg"
         if raw_path.exists():
-            return FileResponse(str(raw_path), media_type="image/jpeg")
+            return _frame_file_response(str(raw_path))
         if img is not None:
             return _jpeg_response(img)
         raise HTTPException(404, f"Frame {frame_idx} not found for {video_name}")
@@ -1933,7 +1951,7 @@ def get_frame(
     # raw
     raw_path = OUTPUT_ROOT / video_name / "frames" / f"frame_{frame_idx:06d}.jpg"
     if raw_path.exists():
-        return FileResponse(str(raw_path), media_type="image/jpeg")
+        return _frame_file_response(str(raw_path))
     img = read_frame_bgr(
         video_name, frame_idx, OUTPUT_ROOT, video_path=resolved_vp,
     )

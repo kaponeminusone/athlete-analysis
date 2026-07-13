@@ -13,6 +13,8 @@ Variables y valores por defecto:
   TJ_CORRECTION_WRITE_FRAMES = "1"  → propagate_correction escribe frames/*.jpg
   TJ_ANNOTATED_CACHE         = "0"  → LRU en memoria para bytes anotados en get_frame
   TJ_FRAME_CACHE             = "0"  → LRU en memoria para frames decodificados (frame_io)
+  TJ_FRAME_CACHE_MAX         = "128" → tamaño LRU de frames BGR (si TJ_FRAME_CACHE=1)
+  TJ_ANNOTATED_CACHE_MAX     = "64"  → tamaño LRU de JPEG anotados (si TJ_ANNOTATED_CACHE=1)
   TJ_JPEG_QUALITY            = "95" → calidad JPEG al codificar en memoria (cv2.imencode)
 
 Poner cualquiera a "0"/"false"/"no"/"off" desactiva la escritura correspondiente.
@@ -30,6 +32,17 @@ def _env_bool(name: str, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in _TRUE
+
+
+def _env_int(name: str, default: int, *, minimum: int = 1, maximum: int = 4096) -> int:
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        return default
+    return max(minimum, min(maximum, value))
 
 
 # ─── Escritores en disco (default = comportamiento actual, TRUE) ───────────────
@@ -59,6 +72,16 @@ def annotated_cache() -> bool:
 def frame_cache() -> bool:
     """LRU opcional para frames BGR decodificados desde video."""
     return _env_bool("TJ_FRAME_CACHE", False)
+
+
+def frame_cache_max() -> int:
+    """Tamaño máximo del LRU de frames BGR (TJ_FRAME_CACHE_MAX, default 128)."""
+    return _env_int("TJ_FRAME_CACHE_MAX", 128, minimum=8, maximum=2048)
+
+
+def annotated_cache_max() -> int:
+    """Tamaño máximo del LRU de JPEG anotados (TJ_ANNOTATED_CACHE_MAX, default 64)."""
+    return _env_int("TJ_ANNOTATED_CACHE_MAX", 64, minimum=8, maximum=2048)
 
 
 # ─── Calidad de codificación en memoria ───────────────────────────────────────

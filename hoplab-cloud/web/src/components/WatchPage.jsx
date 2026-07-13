@@ -331,6 +331,35 @@ export default function WatchPage({ athlete, session, autoAnalyze = false, onBac
     [frameIndex, seek],
   );
 
+  // Prefetch ±8 vecinos (raw + annotated si tracking). Ignora generaciones stale al scrubear rápido.
+  const prefetchGen = useRef(0);
+  useEffect(() => {
+    if (!frames.length || frameCount < 2) return undefined;
+    const gen = ++prefetchGen.current;
+    const timer = window.setTimeout(() => {
+      if (gen !== prefetchGen.current) return;
+      for (let d = -8; d <= 8; d++) {
+        if (d === 0) continue;
+        const i = frameIndex + d;
+        if (i < 0 || i >= frameCount) continue;
+        const f = frames[i];
+        if (!f) continue;
+        const urls = [f.raw];
+        if (trackingOn && f.annotated) urls.push(f.annotated);
+        for (const u of urls) {
+          if (!u) continue;
+          const src = `${u}${u.includes("?") ? "&" : "?"}v=${reloadToken}`;
+          const img = new Image();
+          img.decoding = "async";
+          img.src = src;
+        }
+      }
+    }, 50);
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [frameIndex, frameCount, frames, trackingOn, reloadToken]);
+
   // Reproducción ~fps de la secuencia de frames.
   useEffect(() => {
     if (!playing || frameCount < 2) return undefined;
@@ -998,6 +1027,10 @@ export default function WatchPage({ athlete, session, autoAnalyze = false, onBac
                         <p className="mt-0.5 text-[11px] leading-snug text-muted">
                           Reproduce el video para elegir el rango de análisis (inicio/fin) en el panel. Luego
                           configura y pulsa Analizar.
+                        </p>
+                        <p className="mt-1 text-[11px] leading-snug text-soft">
+                          La primera reproducción por el túnel puede tardar cerca de 1 minuto en archivos de
+                          varios MB.
                         </p>
                         {rawVideoError && (
                           <p className="mt-1 text-[11px] text-warn">

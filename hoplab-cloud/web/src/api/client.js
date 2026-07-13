@@ -197,6 +197,12 @@ export async function saveCalibration(videoName, calibration) {
   });
 }
 
+/** Estado del modelo CNN de venue (pista/arena). */
+export async function getVenueModel(venueId) {
+  const qs = venueId ? `?venue_id=${encodeURIComponent(venueId)}` : "";
+  return fetchJson(absUrl(`/api/venue/model${qs}`));
+}
+
 /** Aprende colores de pista/arena desde la calibración + exporta dataset CNN. */
 export async function learnVenue({ videoName, videoPath, venueId, accumulate = true, samples } = {}) {
   const body = { video_name: videoName };
